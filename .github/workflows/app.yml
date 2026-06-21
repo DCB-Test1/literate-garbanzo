@@ -20,19 +20,53 @@ jobs:
       NOVNC_PORT: "6080"
 
     steps:
-      - name: Show environment
+      # ---------------------------------------------------------
+      # CHECKOUT
+      # ---------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------
+      # ENVIRONMENT INFORMATION
+      # ---------------------------------------------------------
+      - name: Show macOS environment
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          echo "=== macOS ==="
           sw_vers
+
+          echo
+          echo "=== Architecture ==="
           uname -m
+
+          echo
+          echo "=== SIP ==="
           csrutil status || true
+
+          echo
+          echo "=== Current user ==="
           whoami
-          xcodebuild -version
+          id
+
+          echo
+          echo "=== Console session ==="
+          scutil <<< "show State:/Users/ConsoleUser" || true
+
+          echo
+          echo "=== WindowServer ==="
           pgrep -laf WindowServer || true
 
-      - name: Configure macOS VNC
+          echo
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcode-select -p
+
+      # ---------------------------------------------------------
+      # ENABLE SCREEN SHARING AND LEGACY VNC
+      # ---------------------------------------------------------
+      - name: Configure macOS Screen Sharing
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -40,7 +74,7 @@ jobs:
           set -Eeuo pipefail
 
           if [[ -z "${VNC_PASSWORD:-}" ]]; then
-            echo "::error::VNC_PASSWORD secret is missing."
+            echo "::error::VNC_PASSWORD GitHub secret is missing."
             exit 1
           fi
 
@@ -50,7 +84,7 @@ jobs:
           import os
           import sys
 
-          password = os.environ["VNC_PASSWORD"]
+          password = os.environ.get("VNC_PASSWORD", "")
 
           try:
               raw = password.encode("ascii")
@@ -68,38 +102,51 @@ jobs:
           print("VNC password validation passed.")
           PY
 
+          sudo -n true
+
           TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
           SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
 
-          sudo -n true
-
           if [[ ! -f "$TCC_DB" ]]; then
-            echo "::error::TCC database not found."
+            echo "::error::System TCC database was not found."
             exit 1
           fi
 
           if [[ ! -x "$KICKSTART" ]]; then
-            echo "::error::Apple Remote Desktop kickstart utility not found."
+            echo "::error::Apple Remote Desktop kickstart utility was not found."
             exit 1
           fi
 
-          echo "Testing TCC database access..."
+          echo
+          echo "=== Testing TCC database access ==="
 
           sudo sqlite3 "$TCC_DB" "
             BEGIN IMMEDIATE;
+
             UPDATE access
             SET auth_value = auth_value
             WHERE client = 'com.apple.screensharing.agent';
+
             ROLLBACK;
           "
 
+          echo "System TCC database is writable."
+
+          echo
+          echo "=== Loading Screen Sharing service ==="
+
           sudo launchctl enable system/com.apple.screensharing || true
-          sudo launchctl bootstrap system "$SCREENSHARING_PLIST" 2>/dev/null || true
+
+          sudo launchctl bootstrap \
+            system \
+            "$SCREENSHARING_PLIST" \
+            2>/dev/null || true
 
           EPOCH="$(date +%s)"
 
-          echo "Installing Screen Sharing privacy permissions..."
+          echo
+          echo "=== Granting Screen Sharing permissions ==="
 
           sudo sqlite3 "$TCC_DB" <<SQL
           BEGIN IMMEDIATE;
@@ -162,20 +209,34 @@ jobs:
           COMMIT;
           SQL
 
-          echo "Installed TCC permissions:"
+          echo
+          echo "=== Installed TCC permissions ==="
 
-          sudo sqlite3 -header -column "$TCC_DB" "
-            SELECT service, client, auth_value, auth_reason
-            FROM access
-            WHERE client = 'com.apple.screensharing.agent';
-          "
+          sudo sqlite3 \
+            -header \
+            -column \
+            "$TCC_DB" "
+              SELECT
+                service,
+                client,
+                client_type,
+                auth_value,
+                auth_reason,
+                last_modified
+              FROM access
+              WHERE client = 'com.apple.screensharing.agent';
+            "
+
+          echo
+          echo "=== Restarting TCC services ==="
 
           sudo killall tccd 2>/dev/null || true
           killall tccd 2>/dev/null || true
 
           sleep 4
 
-          echo "Stopping old Remote Management processes..."
+          echo
+          echo "=== Stopping previous Screen Sharing services ==="
 
           sudo "$KICKSTART" -deactivate || true
           sudo killall ARDAgent 2>/dev/null || true
@@ -184,7 +245,8 @@ jobs:
 
           sleep 3
 
-          echo "Activating Remote Management..."
+          echo
+          echo "=== Activating Remote Management ==="
 
           sudo "$KICKSTART" \
             -activate \
@@ -193,11 +255,17 @@ jobs:
             -allowAccessFor -allUsers \
             -privs -all
 
+          echo
+          echo "=== Enabling legacy VNC authentication ==="
+
           sudo "$KICKSTART" \
             -configure \
             -clientopts \
             -setvnclegacy \
             -vnclegacy yes
+
+          echo
+          echo "=== Setting VNC password ==="
 
           sudo "$KICKSTART" \
             -configure \
@@ -205,7 +273,8 @@ jobs:
             -setvncpw \
             -vncpw "$VNC_PASSWORD"
 
-          echo "Writing legacy VNC preferences directly..."
+          echo
+          echo "=== Writing Remote Management preferences ==="
 
           sudo defaults write \
             /Library/Preferences/com.apple.RemoteManagement \
@@ -222,80 +291,73 @@ jobs:
             VNCAlwaysStartOnConsole \
             -bool true
 
-          ENCODED_PASSWORD="$(
-            printf '%s\n' "$VNC_PASSWORD" |
-            perl -we '
-              BEGIN {
-                @k = unpack "C*",
-                  pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"
-              }
-
-              $_ = <>;
-              chomp;
-              s/^(.{8}).*/$1/;
-
-              @p = unpack "C*", $_;
-
-              foreach (@k) {
-                printf "%02X", $_ ^ (shift @p || 0);
-              }
-            '
-          )"
-
-          printf '%s' "$ENCODED_PASSWORD" > "$RUNNER_TEMP/VNCSettings.txt"
-
-          sudo install \
-            -o root \
-            -g wheel \
-            -m 600 \
-            "$RUNNER_TEMP/VNCSettings.txt" \
-            /Library/Preferences/com.apple.VNCSettings.txt
-
-          unset ENCODED_PASSWORD
-
-          echo "Legacy VNC configuration:"
-
-          sudo defaults read \
-            /Library/Preferences/com.apple.RemoteManagement \
-            VNCLegacyConnectionsEnabled || true
-
-          sudo ls -l /Library/Preferences/com.apple.VNCSettings.txt
-
-          echo "Restarting Screen Sharing..."
+          echo
+          echo "=== Starting Screen Sharing services ==="
 
           sudo launchctl enable system/com.apple.screensharing || true
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+          sudo launchctl kickstart \
+            -k \
+            system/com.apple.screensharing \
+            2>/dev/null || true
 
           sudo "$KICKSTART" -restart -agent -console || \
             sudo "$KICKSTART" -restart -agent || true
 
           sleep 12
 
+          echo
+          echo "=== Waiting for VNC port ${VNC_PORT} ==="
+
           READY=0
 
           for attempt in {1..30}; do
             if nc -z 127.0.0.1 "$VNC_PORT"; then
               READY=1
+              echo "VNC is listening on localhost:${VNC_PORT}."
               break
             fi
 
-            echo "Waiting for VNC: ${attempt}/30"
+            echo "Attempt ${attempt}/30: waiting for VNC..."
             sleep 2
           done
 
           if [[ "$READY" -ne 1 ]]; then
             echo "::error::VNC did not start on port ${VNC_PORT}."
+
+            echo
+            echo "=== Related processes ==="
+
+            ps aux |
+              grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
+              grep -v grep || true
+
+            echo
+            echo "=== Listening ports ==="
+
             sudo lsof -nP -iTCP -sTCP:LISTEN || true
+
             exit 1
           fi
 
-          echo "VNC is listening."
+          echo
+          echo "=== VNC processes ==="
+
+          ps aux |
+            grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
+            grep -v grep || true
+
+          echo
+          echo "=== VNC listener ==="
 
           sudo lsof \
             -nP \
             -iTCP:"$VNC_PORT" \
             -sTCP:LISTEN || true
 
+      # ---------------------------------------------------------
+      # VERIFY VNC SECURITY TYPES
+      # ---------------------------------------------------------
       - name: Verify VNC authentication types
         shell: bash
         run: |
@@ -305,20 +367,27 @@ jobs:
           import socket
           import sys
 
-          def receive_exact(sock, length):
-              data = bytearray()
 
-              while len(data) < length:
-                  chunk = sock.recv(length - len(data))
+          def receive_exact(sock: socket.socket, length: int) -> bytes:
+              result = bytearray()
+
+              while len(result) < length:
+                  chunk = sock.recv(length - len(result))
 
                   if not chunk:
-                      raise RuntimeError("VNC connection closed unexpectedly")
+                      raise RuntimeError(
+                          "VNC connection closed unexpectedly."
+                      )
 
-                  data.extend(chunk)
+                  result.extend(chunk)
 
-              return bytes(data)
+              return bytes(result)
 
-          with socket.create_connection(("127.0.0.1", 5900), timeout=10) as sock:
+
+          with socket.create_connection(
+              ("127.0.0.1", 5900),
+              timeout=10,
+          ) as sock:
               banner = receive_exact(sock, 12)
 
               print("Server VNC banner:", repr(banner))
@@ -327,25 +396,34 @@ jobs:
                   print("::error::Invalid VNC protocol banner.")
                   sys.exit(1)
 
+              # Negotiate standard RFB 3.8 even though Apple announces 3.889.
               sock.sendall(b"RFB 003.008\n")
 
-              count_data = receive_exact(sock, 1)
-              count = count_data[0]
+              security_count = receive_exact(sock, 1)[0]
 
-              if count == 0:
+              if security_count == 0:
                   reason_length = int.from_bytes(
                       receive_exact(sock, 4),
-                      byteorder="big"
-                  )
-                  reason = receive_exact(sock, reason_length).decode(
-                      "utf-8",
-                      errors="replace"
+                      byteorder="big",
                   )
 
-                  print(f"::error::VNC server rejected negotiation: {reason}")
+                  reason = receive_exact(
+                      sock,
+                      reason_length,
+                  ).decode(
+                      "utf-8",
+                      errors="replace",
+                  )
+
+                  print(
+                      "::error::VNC security negotiation failed: "
+                      f"{reason}"
+                  )
                   sys.exit(1)
 
-              security_types = list(receive_exact(sock, count))
+              security_types = list(
+                  receive_exact(sock, security_count)
+              )
 
               print("Advertised security types:", security_types)
               print("Type 2  = standard VNC password")
@@ -353,168 +431,222 @@ jobs:
 
               if 2 not in security_types:
                   print(
-                      "::error::Standard VNC authentication type 2 is missing. "
-                      "Apple legacy VNC configuration did not apply."
+                      "::error::Standard VNC authentication type 2 "
+                      "was not advertised."
                   )
                   sys.exit(1)
 
-              print("Standard VNC password authentication is available.")
+              print(
+                  "Standard VNC password authentication type 2 "
+                  "is available."
+              )
           PY
 
-      - name: Verify desktop capture
+      # ---------------------------------------------------------
+      # VERIFY DESKTOP SCREEN CAPTURE
+      # ---------------------------------------------------------
+      - name: Verify desktop screen capture
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          screencapture -x "$RUNNER_TEMP/macos-desktop.png"
+          SCREENSHOT="$RUNNER_TEMP/macos-desktop.png"
 
-          if [[ ! -s "$RUNNER_TEMP/macos-desktop.png" ]]; then
-            echo "::error::Desktop screenshot failed."
+          screencapture -x "$SCREENSHOT"
+
+          if [[ ! -s "$SCREENSHOT" ]]; then
+            echo "::error::Desktop screenshot was not created."
             exit 1
           fi
 
-          ls -lh "$RUNNER_TEMP/macos-desktop.png"
+          echo "Desktop screenshot created:"
+          ls -lh "$SCREENSHOT"
+          file "$SCREENSHOT"
 
+      - name: Upload desktop screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-desktop
+          path: ${{ runner.temp }}/macos-desktop.png
+          if-no-files-found: error
+          retention-days: 1
+
+      # ---------------------------------------------------------
+      # INSTALL PINNED NOVNC AND FORCE STANDARD VNC AUTH
+      # ---------------------------------------------------------
       - name: Install and patch noVNC
-    shell: bash
-    run: |
-      set -Eeuo pipefail
-  
-      NOVNC_DIR="$RUNNER_TEMP/noVNC"
-      NOVNC_REPOSITORY="https://github.com/novnc/noVNC.git"
-  
-      rm -rf "$NOVNC_DIR"
-      mkdir -p "$NOVNC_DIR"
-  
-      echo "Resolving the real noVNC v1.7.0 commit..."
-  
-      NOVNC_COMMIT="$(
-        git ls-remote "$NOVNC_REPOSITORY" \
-          'refs/tags/v1.7.0^{}' |
-        awk 'NR == 1 { print $1 }'
-      )"
-  
-      # Fallback in case Git returns no peeled annotated-tag reference.
-      if [[ -z "$NOVNC_COMMIT" ]]; then
-        NOVNC_COMMIT="$(
-          git ls-remote "$NOVNC_REPOSITORY" \
-            'refs/tags/v1.7.0' |
-          awk 'NR == 1 { print $1 }'
-        )"
-      fi
-  
-      if [[ -z "$NOVNC_COMMIT" ]]; then
-        echo "::error::Unable to resolve noVNC v1.7.0."
-        exit 1
-      fi
-  
-      echo "Resolved noVNC commit: $NOVNC_COMMIT"
-  
-      git -C "$NOVNC_DIR" init
-      git -C "$NOVNC_DIR" remote add origin "$NOVNC_REPOSITORY"
-      git -C "$NOVNC_DIR" fetch \
-        --depth=1 \
-        origin \
-        "$NOVNC_COMMIT"
-  
-      git -C "$NOVNC_DIR" checkout --detach FETCH_HEAD
-  
-      echo
-      echo "Installed noVNC commit:"
-      git -C "$NOVNC_DIR" log -1 --oneline
-  
-      NOVNC_RFB="$NOVNC_DIR/core/rfb.js"
-  
-      if [[ ! -f "$NOVNC_RFB" ]]; then
-        echo "::error::Missing noVNC file: $NOVNC_RFB"
-        exit 1
-      fi
-  
-      echo
-      echo "Patching noVNC to prefer standard VNC password authentication..."
-  
-      NOVNC_RFB="$NOVNC_RFB" python3 <<'PY'
-      import os
-      import re
-      import sys
-      from pathlib import Path
-  
-      path = Path(os.environ["NOVNC_RFB"])
-      source = path.read_text(encoding="utf-8")
-  
-      # Patch only the main RFB security-type selection block.
-      # Do not patch the separate VeNCrypt subtype-selection block.
-      pattern = re.compile(
-          r"""
-          this\._rfbAuthScheme\s*=\s*-1;\s*
-          for\s*\(\s*let\s+type\s+of\s+types\s*\)\s*\{\s*
-              if\s*\(\s*this\._isSupportedSecurityType\(type\)\s*\)\s*\{\s*
-                  this\._rfbAuthScheme\s*=\s*type;\s*
-                  break;\s*
-              \}\s*
-          \}
-          """,
-          re.VERBOSE,
-      )
-  
-      replacement = """this._rfbAuthScheme = -1;
-  
-              // Apple normally advertises ARD authentication before
-              // standard password-only VNC authentication. Prefer type 2.
-              if (types.includes(securityTypeVNCAuth)) {
-                  this._rfbAuthScheme = securityTypeVNCAuth;
-              } else {
-                  for (let type of types) {
-                      if (this._isSupportedSecurityType(type)) {
-                          this._rfbAuthScheme = type;
-                          break;
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          NOVNC_DIR="$RUNNER_TEMP/noVNC"
+
+          # Official noVNC 1.7.0 release commit.
+          NOVNC_COMMIT="63107bd06d9e1f6136ff21aeda8cd62cbf0d433e"
+          NOVNC_REPOSITORY="https://github.com/novnc/noVNC.git"
+
+          rm -rf "$NOVNC_DIR"
+          mkdir -p "$NOVNC_DIR"
+
+          echo "Downloading noVNC commit:"
+          echo "$NOVNC_COMMIT"
+
+          git -C "$NOVNC_DIR" init
+          git -C "$NOVNC_DIR" remote add origin "$NOVNC_REPOSITORY"
+
+          git -C "$NOVNC_DIR" fetch \
+            --depth=1 \
+            origin \
+            "$NOVNC_COMMIT"
+
+          git -C "$NOVNC_DIR" checkout \
+            --detach \
+            FETCH_HEAD
+
+          echo
+          echo "=== Installed noVNC version ==="
+
+          git -C "$NOVNC_DIR" log -1 --oneline
+
+          NOVNC_RFB="$NOVNC_DIR/core/rfb.js"
+
+          if [[ ! -f "$NOVNC_RFB" ]]; then
+            echo "::error::Missing noVNC source file: $NOVNC_RFB"
+            exit 1
+          fi
+
+          echo
+          echo "Patching noVNC to prefer security type 2..."
+
+          NOVNC_RFB="$NOVNC_RFB" python3 <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+
+          path = Path(os.environ["NOVNC_RFB"])
+          source = path.read_text(encoding="utf-8")
+
+          method_start_marker = "_negotiateSecurity() {"
+          method_end_marker = "_handleSecurityReason() {"
+
+          method_start = source.find(method_start_marker)
+
+          if method_start == -1:
+              print(
+                  "::error::Could not locate "
+                  "_negotiateSecurity() in noVNC."
+              )
+              sys.exit(1)
+
+          method_end = source.find(
+              method_end_marker,
+              method_start,
+          )
+
+          if method_end == -1:
+              print(
+                  "::error::Could not locate the end of "
+                  "_negotiateSecurity()."
+              )
+              sys.exit(1)
+
+          selection_start = source.find(
+              "// Look for a matching security type",
+              method_start,
+              method_end,
+          )
+
+          if selection_start == -1:
+              print(
+                  "::error::Could not locate noVNC's main "
+                  "security-selection block."
+              )
+              sys.exit(1)
+
+          # Include indentation before the comment.
+          selection_start = source.rfind(
+              "\n",
+              method_start,
+              selection_start,
+          ) + 1
+
+          selection_end_marker = (
+              "        if (this._rfbAuthScheme === -1) {"
+          )
+
+          selection_end = source.find(
+              selection_end_marker,
+              selection_start,
+              method_end,
+          )
+
+          if selection_end == -1:
+              print(
+                  "::error::Could not locate noVNC's "
+                  "security-selection ending."
+              )
+              sys.exit(1)
+
+          replacement = """        // Prefer classic VNC password authentication.
+                  //
+                  // Apple's VNC server normally advertises Apple Remote
+                  // Desktop authentication before classic VNC auth.
+                  // The GitHub workflow configures a temporary classic
+                  // VNC password, so explicitly select security type 2.
+                  this._rfbAuthScheme = -1;
+
+                  if (Array.from(types).includes(securityTypeVNCAuth)) {
+                      this._rfbAuthScheme = securityTypeVNCAuth;
+                  } else {
+                      for (let type of types) {
+                          if (this._isSupportedSecurityType(type)) {
+                              this._rfbAuthScheme = type;
+                              break;
+                          }
                       }
                   }
-              }"""
-  
-      patched, replacement_count = pattern.subn(
-          replacement,
-          source,
-          count=1,
-      )
-  
-      if replacement_count != 1:
-          print(
-              "::error::Unable to uniquely locate noVNC's main "
-              "security-selection block."
+
+          """
+
+          patched = (
+              source[:selection_start]
+              + replacement
+              + source[selection_end:]
           )
-  
-          marker = "Server security types"
-          position = source.find(marker)
-  
-          if position >= 0:
-              start = max(0, position - 500)
-              end = min(len(source), position + 1500)
-  
-              print("Relevant noVNC source:")
-              print(source[start:end])
-  
-          sys.exit(1)
-  
-      path.write_text(patched, encoding="utf-8")
-  
-      print("noVNC authentication patch applied successfully.")
-      PY
-  
-      echo
-      echo "=== Confirming patch ==="
-  
-      grep -n -A12 -B4 \
-        "Apple normally advertises ARD" \
-        "$NOVNC_RFB"
-  
-      echo
-      echo "=== JavaScript syntax check ==="
-  
-      node --check "$NOVNC_RFB"
 
-    echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
+          if patched == source:
+              print("::error::noVNC source was not modified.")
+              sys.exit(1)
 
+          path.write_text(
+              patched,
+              encoding="utf-8",
+          )
+
+          print("noVNC security-selection patch applied.")
+          PY
+
+          echo
+          echo "=== Confirming patch ==="
+
+          grep \
+            -n \
+            -A20 \
+            -B5 \
+            "Prefer classic VNC password authentication" \
+            "$NOVNC_RFB"
+
+          echo
+          echo "=== Checking JavaScript syntax ==="
+
+          node --check "$NOVNC_RFB"
+
+          echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------
+      # START NOVNC / WEBSOCKIFY
+      # ---------------------------------------------------------
       - name: Start noVNC
         shell: bash
         run: |
@@ -528,33 +660,57 @@ jobs:
 
           NOVNC_PID=$!
 
-          echo "$NOVNC_PID" > "$RUNNER_TEMP/novnc.pid"
           echo "NOVNC_PID=$NOVNC_PID" >> "$GITHUB_ENV"
+          echo "$NOVNC_PID" > "$RUNNER_TEMP/novnc.pid"
 
-          for attempt in {1..30}; do
+          echo "Waiting for noVNC..."
+
+          READY=0
+
+          for attempt in {1..45}; do
             if curl \
               --silent \
               --fail \
               "http://127.0.0.1:${NOVNC_PORT}/vnc.html" \
               >/dev/null; then
+
+              READY=1
               echo "noVNC is ready."
-              exit 0
+              break
             fi
 
             if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
               echo "::error::noVNC stopped unexpectedly."
+
+              echo
+              echo "=== noVNC log ==="
+
               cat "$RUNNER_TEMP/novnc.log" || true
               exit 1
             fi
 
-            echo "Waiting for noVNC: ${attempt}/30"
+            echo "Attempt ${attempt}/45: waiting for noVNC..."
             sleep 2
           done
 
-          echo "::error::noVNC did not become ready."
-          cat "$RUNNER_TEMP/novnc.log" || true
-          exit 1
+          if [[ "$READY" -ne 1 ]]; then
+            echo "::error::noVNC did not become ready."
 
+            echo
+            echo "=== noVNC log ==="
+
+            cat "$RUNNER_TEMP/novnc.log" || true
+            exit 1
+          fi
+
+          echo
+          echo "=== noVNC log ==="
+
+          cat "$RUNNER_TEMP/novnc.log" || true
+
+      # ---------------------------------------------------------
+      # INSTALL CLOUDFLARED
+      # ---------------------------------------------------------
       - name: Install Cloudflare Tunnel
         shell: bash
         run: |
@@ -566,8 +722,14 @@ jobs:
             brew install cloudflared
           fi
 
+          echo
+          echo "=== cloudflared version ==="
+
           cloudflared --version
 
+      # ---------------------------------------------------------
+      # START FREE CLOUDFLARE QUICK TUNNEL
+      # ---------------------------------------------------------
       - name: Start Cloudflare Quick Tunnel
         shell: bash
         run: |
@@ -581,14 +743,17 @@ jobs:
 
           CLOUDFLARED_PID=$!
 
-          echo "$CLOUDFLARED_PID" > "$RUNNER_TEMP/cloudflared.pid"
           echo "CLOUDFLARED_PID=$CLOUDFLARED_PID" >> "$GITHUB_ENV"
+          echo "$CLOUDFLARED_PID" > "$RUNNER_TEMP/cloudflared.pid"
+
+          echo "Waiting for Cloudflare Quick Tunnel URL..."
 
           CF_URL=""
 
           for attempt in {1..60}; do
             CF_URL="$(
-              grep -Eo \
+              grep \
+                -Eo \
                 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
                 "$RUNNER_TEMP/cloudflared.log" |
               head -n 1 || true
@@ -599,17 +764,25 @@ jobs:
             fi
 
             if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
-              echo "::error::Cloudflare Tunnel stopped unexpectedly."
+              echo "::error::cloudflared stopped unexpectedly."
+
+              echo
+              echo "=== cloudflared log ==="
+
               cat "$RUNNER_TEMP/cloudflared.log" || true
               exit 1
             fi
 
-            echo "Waiting for Cloudflare URL: ${attempt}/60"
+            echo "Attempt ${attempt}/60: waiting for tunnel URL..."
             sleep 2
           done
 
           if [[ -z "$CF_URL" ]]; then
             echo "::error::Cloudflare Quick Tunnel URL was not created."
+
+            echo
+            echo "=== cloudflared log ==="
+
             cat "$RUNNER_TEMP/cloudflared.log" || true
             exit 1
           fi
@@ -619,24 +792,54 @@ jobs:
           echo "CF_URL=$CF_URL" >> "$GITHUB_ENV"
           echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
 
-          echo "Cloudflare tunnel created:"
-          echo "$NOVNC_URL"
+          echo
+          echo "Cloudflare Quick Tunnel created:"
+          echo "$CF_URL"
 
-      - name: Print connection details
+          echo
+          echo "Waiting for public noVNC page..."
+
+          PUBLIC_READY=0
+
+          for attempt in {1..30}; do
+            if curl \
+              --silent \
+              --fail \
+              "${CF_URL}/vnc.html" \
+              >/dev/null; then
+
+              PUBLIC_READY=1
+              echo "Public noVNC page is ready."
+              break
+            fi
+
+            echo "Attempt ${attempt}/30: waiting for public page..."
+            sleep 3
+          done
+
+          if [[ "$PUBLIC_READY" -ne 1 ]]; then
+            echo "::warning::Tunnel exists, but the public page was not ready yet."
+          fi
+
+      # ---------------------------------------------------------
+      # PRINT CONNECTION INFORMATION
+      # ---------------------------------------------------------
+      - name: Print browser connection details
         shell: bash
         run: |
           set -Eeuo pipefail
 
           echo
           echo "======================================================"
-          echo " MACOS BROWSER DESKTOP"
+          echo " MACOS BROWSER DESKTOP IS READY"
           echo "======================================================"
           echo
           echo "$NOVNC_URL"
           echo
           echo "Username : leave blank"
-          echo "Password : value of VNC_PASSWORD"
+          echo "Password : value stored in VNC_PASSWORD"
           echo
+          echo "Authentication: standard VNC password"
           echo "======================================================"
 
           {
@@ -649,11 +852,15 @@ jobs:
             echo "| Username | Leave blank |"
             echo "| Password | Value stored in \`VNC_PASSWORD\` |"
             echo "| Authentication | Standard VNC password |"
+            echo "| Transport | Cloudflare HTTPS and noVNC |"
             echo
             echo "Cancel the workflow when finished."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep desktop running
+      # ---------------------------------------------------------
+      # KEEP THE TEMPORARY MAC RUNNING
+      # ---------------------------------------------------------
+      - name: Keep macOS desktop running
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -662,35 +869,54 @@ jobs:
           CAFFEINATE_PID=$!
 
           cleanup() {
+            echo "Stopping temporary services..."
+
             kill "$CAFFEINATE_PID" 2>/dev/null || true
 
             if [[ -f "$RUNNER_TEMP/cloudflared.pid" ]]; then
-              kill "$(cat "$RUNNER_TEMP/cloudflared.pid")" 2>/dev/null || true
+              kill "$(
+                cat "$RUNNER_TEMP/cloudflared.pid"
+              )" 2>/dev/null || true
             fi
 
             if [[ -f "$RUNNER_TEMP/novnc.pid" ]]; then
-              kill "$(cat "$RUNNER_TEMP/novnc.pid")" 2>/dev/null || true
+              kill "$(
+                cat "$RUNNER_TEMP/novnc.pid"
+              )" 2>/dev/null || true
             fi
           }
 
           trap cleanup EXIT INT TERM
 
-          echo "Desktop is active:"
+          echo "macOS browser desktop is active."
           echo "$NOVNC_URL"
+          echo
+          echo "Cancel this workflow when finished."
 
           while true; do
             if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
               echo "::error::Cloudflare Tunnel stopped."
+
+              echo
+              echo "=== cloudflared log ==="
+
               cat "$RUNNER_TEMP/cloudflared.log" || true
               exit 1
             fi
 
             if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
               echo "::error::noVNC stopped."
+
+              echo
+              echo "=== noVNC log ==="
+
               cat "$RUNNER_TEMP/novnc.log" || true
               exit 1
             fi
 
+            echo
             echo "Desktop alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "URL: $NOVNC_URL"
+
             sleep 300
           done
