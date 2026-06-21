@@ -1,4 +1,5 @@
-name: APP DEBUG
+name: Temporary macOS VNC Desktop
+
 on:
   workflow_dispatch:
 
@@ -6,31 +7,52 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-vnc-desktop
+  group: temporary-macos-vnc
   cancel-in-progress: true
 
 jobs:
   macos-vnc:
-    # Important: use macos-14 for this TCC method.
+    # This TCC workaround is confirmed against the macOS 14 runner.
     runs-on: macos-14
     timeout-minutes: 180
 
+    env:
+      VNC_PORT: "5900"
+      TAILSCALE_VNC_PORT: "5901"
+
     steps:
+      # -------------------------------------------------------------
+      # 1. CHECKOUT
+      # -------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------------
+      # 2. RUNNER INFORMATION
+      # -------------------------------------------------------------
       - name: Show macOS environment
         shell: bash
         run: |
+          set -Eeuo pipefail
+
           echo "=== macOS ==="
           sw_vers
+
+          echo
+          echo "=== Architecture ==="
+          uname -m
 
           echo
           echo "=== SIP ==="
           csrutil status || true
 
           echo
-          echo "=== Console user ==="
+          echo "=== Current user ==="
+          whoami
+          id
+
+          echo
+          echo "=== Console session ==="
           scutil <<< "show State:/Users/ConsoleUser" || true
 
           echo
@@ -42,7 +64,19 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
-      - name: Connect to Tailscale
+          echo
+          echo "=== Available Xcode applications ==="
+          find /Applications \
+            -maxdepth 1 \
+            -type d \
+            -name 'Xcode*.app' \
+            -print \
+            | sort
+
+      # -------------------------------------------------------------
+      # 3. CONNECT TO TAILSCALE
+      # -------------------------------------------------------------
+      - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -50,7 +84,31 @@ jobs:
           tags: tag:ci
           version: latest
 
-      - name: Enable Screen Sharing through TCC
+      - name: Verify Tailscale connection
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Tailscale status ==="
+          tailscale status
+
+          echo
+          echo "=== Tailscale IPv4 ==="
+          tailscale ip -4
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Tailscale did not assign an IPv4 address."
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------------
+      # 4. ENABLE SCREEN RECORDING + REMOTE CONTROL IN TCC
+      # -------------------------------------------------------------
+      - name: Configure macOS Screen Sharing and VNC
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -58,10 +116,11 @@ jobs:
           set -Eeuo pipefail
 
           if [[ -z "${VNC_PASSWORD:-}" ]]; then
-            echo "::error::VNC_PASSWORD secret is missing."
+            echo "::error::VNC_PASSWORD GitHub secret is missing."
             exit 1
           fi
 
+          # Hide the password if a command accidentally prints it.
           echo "::add-mask::$VNC_PASSWORD"
 
           python3 <<'PY'
@@ -73,61 +132,74 @@ jobs:
           try:
               encoded = password.encode("ascii")
           except UnicodeEncodeError:
-              print("::error::VNC_PASSWORD must use ASCII characters only.")
+              print("::error::VNC_PASSWORD must contain ASCII characters only.")
               sys.exit(1)
 
           if len(encoded) != 8:
               print(
-                  "::error::VNC_PASSWORD must be exactly "
-                  f"8 ASCII characters, received {len(encoded)}."
+                  "::error::VNC_PASSWORD must be exactly 8 ASCII characters. "
+                  f"Received {len(encoded)} bytes."
               )
               sys.exit(1)
 
           print("VNC password validation passed.")
           PY
 
-          DB="/Library/Application Support/com.apple.TCC/TCC.db"
-          SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
+          sudo -n true
+
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
 
-          echo
-          echo "=== Testing system TCC database access ==="
-
-          if [[ ! -f "$DB" ]]; then
-            echo "::error::System TCC database was not found."
+          if [[ ! -f "$TCC_DB" ]]; then
+            echo "::error::System TCC database does not exist: $TCC_DB"
             exit 1
           fi
 
-          # Verify that GitHub's runner permits writing to the system TCC DB.
-          sudo sqlite3 "$DB" "
+          if [[ ! -x "$KICKSTART" ]]; then
+            echo "::error::Apple Remote Desktop kickstart utility was not found."
+            exit 1
+          fi
+
+          echo
+          echo "=== TCC database schema ==="
+
+          sudo sqlite3 "$TCC_DB" "PRAGMA table_info(access);" || {
+            echo "::error::Unable to read the system TCC database."
+            exit 1
+          }
+
+          echo
+          echo "=== Testing TCC database write access ==="
+
+          sudo sqlite3 "$TCC_DB" "
             BEGIN IMMEDIATE;
+
             UPDATE access
             SET auth_value = auth_value
-            WHERE client = '/bin/bash'
-              AND service = 'kTCCServiceScreenCapture';
+            WHERE client = 'com.apple.screensharing.agent';
+
             ROLLBACK;
           "
 
           echo "System TCC database is writable."
 
           echo
-          echo "=== Loading Screen Sharing service ==="
+          echo "=== Loading Screen Sharing launch daemon ==="
 
-          # This may say the service is already loaded; that is harmless.
-          sudo launchctl load -w "$SCREENSHARING_PLIST" 2>/dev/null || true
           sudo launchctl enable system/com.apple.screensharing || true
+
+          sudo launchctl bootstrap \
+            system \
+            "$SCREENSHARING_PLIST" \
+            2>/dev/null || true
 
           EPOCH="$(date +%s)"
 
           echo
-          echo "=== Granting Screen Sharing TCC permissions ==="
+          echo "=== Granting screen capture and remote-input access ==="
 
-          # These are the two permissions normally added by Apple's
-          # EnableRemoteDesktop MDM command.
-          #
-          # Explicit column names make this work with the expanded macOS 14
-          # TCC schema.
-          sudo sqlite3 "$DB" <<SQL
+          sudo sqlite3 "$TCC_DB" <<SQL
           BEGIN IMMEDIATE;
 
           DELETE FROM access
@@ -189,21 +261,23 @@ jobs:
           SQL
 
           echo
-          echo "=== Installed TCC entries ==="
+          echo "=== Installed Screen Sharing TCC permissions ==="
 
-          sudo sqlite3 -header -column "$DB" "
-            SELECT
-              service,
-              client,
-              client_type,
-              auth_value,
-              auth_reason,
-              last_modified
-            FROM access
-            WHERE client = 'com.apple.screensharing.agent';
-          "
+          sudo sqlite3 \
+            -header \
+            -column \
+            "$TCC_DB" "
+              SELECT
+                service,
+                client,
+                client_type,
+                auth_value,
+                auth_reason,
+                last_modified
+              FROM access
+              WHERE client = 'com.apple.screensharing.agent';
+            "
 
-          # Force TCC to reload its database.
           echo
           echo "=== Restarting TCC daemons ==="
 
@@ -212,14 +286,17 @@ jobs:
           sleep 4
 
           echo
-          echo "=== Configuring Apple VNC authentication ==="
-
-          if [[ ! -x "$KICKSTART" ]]; then
-            echo "::error::Apple Remote Desktop kickstart was not found."
-            exit 1
-          fi
+          echo "=== Stopping previous Remote Management processes ==="
 
           sudo "$KICKSTART" -deactivate || true
+          sudo killall ARDAgent 2>/dev/null || true
+          sudo killall ScreensharingAgent 2>/dev/null || true
+          sudo killall screensharingd 2>/dev/null || true
+
+          sleep 3
+
+          echo
+          echo "=== Activating Remote Management ==="
 
           sudo "$KICKSTART" \
             -activate \
@@ -228,11 +305,17 @@ jobs:
             -allowAccessFor -allUsers \
             -privs -all
 
+          echo
+          echo "=== Enabling legacy VNC authentication ==="
+
           sudo "$KICKSTART" \
             -configure \
             -clientopts \
             -setvnclegacy \
             -vnclegacy yes
+
+          echo
+          echo "=== Setting separate VNC password ==="
 
           sudo "$KICKSTART" \
             -configure \
@@ -240,74 +323,240 @@ jobs:
             -setvncpw \
             -vncpw "$VNC_PASSWORD"
 
-          sudo "$KICKSTART" -restart -agent
-
-          # Restart both Screen Sharing and Remote Management components.
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
-          sudo killall ARDAgent 2>/dev/null || true
-
-          sleep 8
-
           echo
-          echo "=== Checking VNC port ==="
+          echo "=== Starting Screen Sharing components ==="
 
-          for attempt in {1..20}; do
-            if nc -z 127.0.0.1 5900; then
-              echo "VNC is listening on TCP port 5900."
-              break
-            fi
+          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl kickstart -k system/com.apple.screensharing || true
 
-            if [[ "$attempt" -eq 20 ]]; then
-              echo "::error::VNC did not start on port 5900."
-              sudo lsof -nP -iTCP:5900 || true
-              exit 1
-            fi
-
-            echo "Waiting for VNC: attempt $attempt/20"
-            sleep 2
-          done
-
-          echo
-          echo "=== VNC processes ==="
-          ps aux | grep -Ei \
-            "screensharing|ARDAgent|remotemanagement" \
-            | grep -v grep \
-            || true
-
-          echo
-          echo "=== Port listener ==="
-          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
-
-      - name: Open Xcode and Simulator
-        shell: bash
-        run: |
-          if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
-            open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
-          elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
-            open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
-          else
-            open -a Xcode || true
-          fi
-
-          open -a Simulator || true
-          open -a Finder || true
+          sudo "$KICKSTART" -restart -agent || true
 
           sleep 10
 
-      - name: Capture desktop test screenshot
+          echo
+          echo "=== Waiting for local VNC port ${VNC_PORT} ==="
+
+          READY=0
+
+          for attempt in {1..30}; do
+            if nc -z 127.0.0.1 "$VNC_PORT"; then
+              echo "VNC is listening on 127.0.0.1:${VNC_PORT}."
+              READY=1
+              break
+            fi
+
+            echo "Attempt ${attempt}/30: VNC is not ready yet."
+            sleep 2
+          done
+
+          if [[ "$READY" -ne 1 ]]; then
+            echo "::error::VNC did not start on port ${VNC_PORT}."
+
+            echo
+            echo "=== Related processes ==="
+            ps aux |
+              grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
+              grep -v grep || true
+
+            echo
+            echo "=== Listening ports ==="
+            sudo lsof -nP -iTCP -sTCP:LISTEN || true
+
+            exit 1
+          fi
+
+          echo
+          echo "=== VNC processes ==="
+
+          ps aux |
+            grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
+            grep -v grep || true
+
+          echo
+          echo "=== VNC listener ==="
+
+          sudo lsof \
+            -nP \
+            -iTCP:"$VNC_PORT" \
+            -sTCP:LISTEN || true
+
+      # -------------------------------------------------------------
+      # 5. FORWARD TAILSCALE PORT 5901 TO LOCAL VNC PORT 5900
+      # -------------------------------------------------------------
+      - name: Expose VNC through Tailscale Serve
         shell: bash
         run: |
-          screencapture -x "$RUNNER_TEMP/macos-desktop.png" || true
-          ls -lh "$RUNNER_TEMP/macos-desktop.png" || true
+          set -Eeuo pipefail
 
-      - name: Upload desktop test screenshot
+          echo "=== Confirming local VNC service ==="
+          nc -vz 127.0.0.1 "$VNC_PORT"
+
+          echo
+          echo "=== Resetting previous Tailscale Serve configuration ==="
+          sudo tailscale serve reset || true
+
+          echo
+          echo "=== Creating raw TCP forwarder ==="
+          echo "Tailscale port ${TAILSCALE_VNC_PORT} -> localhost:${VNC_PORT}"
+
+          sudo tailscale serve \
+            --bg \
+            --tcp="${TAILSCALE_VNC_PORT}" \
+            "tcp://127.0.0.1:${VNC_PORT}"
+
+          sleep 3
+
+          echo
+          echo "=== Tailscale Serve status ==="
+          sudo tailscale serve status
+
+          echo
+          echo "=== Testing forwarded VNC port from runner ==="
+
+          if nc -vz -w 10 "$TAILSCALE_IP" "$TAILSCALE_VNC_PORT"; then
+            echo "Forwarded VNC port is reachable."
+          else
+            echo "::warning::The runner could not test its own forwarded Tailscale port."
+            echo "::warning::Continue and test it from Ubuntu."
+          fi
+
+      # -------------------------------------------------------------
+      # 6. INSTALL FLUTTER
+      # -------------------------------------------------------------
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Flutter project
+        if: ${{ hashFiles('pubspec.yaml') != '' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          flutter --version
+          flutter doctor -v || true
+          flutter pub get
+
+          if [[ -d "$GITHUB_WORKSPACE/ios" ]]; then
+            cd "$GITHUB_WORKSPACE/ios"
+
+            if [[ -f "Podfile" ]]; then
+              pod install --repo-update
+            else
+              echo "No ios/Podfile found; skipping pod install."
+            fi
+          fi
+
+      # -------------------------------------------------------------
+      # 7. OPEN XCODE, FINDER AND SIMULATOR
+      # -------------------------------------------------------------
+      - name: Open Xcode and Simulator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DEVELOPER_DIR_PATH="$(xcode-select -p)"
+          XCODE_APP="$(dirname "$(dirname "$DEVELOPER_DIR_PATH")")"
+          SIMULATOR_APP="${DEVELOPER_DIR_PATH}/Applications/Simulator.app"
+
+          echo "Xcode application: $XCODE_APP"
+          echo "Simulator application: $SIMULATOR_APP"
+
+          open -a Finder "$GITHUB_WORKSPACE" || true
+
+          if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
+            echo "Opening ios/Runner.xcworkspace"
+            open "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
+
+          elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
+            echo "Opening ios/Runner.xcodeproj"
+            open "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
+
+          elif [[ -d "$XCODE_APP" ]]; then
+            echo "No Flutter iOS workspace found; opening Xcode directly."
+            open "$XCODE_APP" || true
+
+          else
+            echo "::warning::Unable to locate the Xcode application."
+          fi
+
+          if [[ -d "$SIMULATOR_APP" ]]; then
+            open "$SIMULATOR_APP" || true
+          else
+            echo "::warning::Simulator application was not found."
+          fi
+
+          sleep 15
+
+      # -------------------------------------------------------------
+      # 8. VERIFY SCREEN CAPTURE
+      # -------------------------------------------------------------
+      - name: Capture desktop verification screenshot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SCREENSHOT="$RUNNER_TEMP/macos-vnc-desktop.png"
+
+          screencapture -x "$SCREENSHOT"
+
+          if [[ ! -s "$SCREENSHOT" ]]; then
+            echo "::error::Desktop screenshot was not created."
+            exit 1
+          fi
+
+          echo "Desktop screenshot created:"
+          ls -lh "$SCREENSHOT"
+          file "$SCREENSHOT"
+
+      - name: Upload desktop verification screenshot
         uses: actions/upload-artifact@v4
         with:
-          name: macos-desktop-test
-          path: ${{ runner.temp }}/macos-desktop.png
-          if-no-files-found: warn
+          name: macos-vnc-desktop
+          path: ${{ runner.temp }}/macos-vnc-desktop.png
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Print VNC details
+      # -------------------------------------------------------------
+      # 9. FINAL NETWORK DIAGNOSTICS
+      # -------------------------------------------------------------
+      - name: Print complete diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Tailscale status ==="
+          tailscale status
+
+          echo
+          echo "=== Tailscale addresses ==="
+          tailscale ip
+
+          echo
+          echo "=== Tailscale Serve ==="
+          sudo tailscale serve status
+
+          echo
+          echo "=== VNC local-port test ==="
+          nc -vz 127.0.0.1 "$VNC_PORT"
+
+          echo
+          echo "=== Listening VNC ports ==="
+          sudo lsof \
+            -nP \
+            -iTCP:"$VNC_PORT" \
+            -sTCP:LISTEN || true
+
+          echo
+          echo "=== Routes ==="
+          netstat -rn || true
+
+      # -------------------------------------------------------------
+      # 10. PRINT CONNECTION DETAILS
+      # -------------------------------------------------------------
+      - name: Print VNC connection details
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -315,49 +564,73 @@ jobs:
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not determine Tailscale IPv4 address."
-            tailscale status || true
+            echo "::error::Unable to obtain the Tailscale IPv4 address."
             exit 1
           fi
 
           echo
-          echo "================================================"
-          echo " MACOS VNC DESKTOP"
-          echo "================================================"
-          echo "Server   : ${TS_IP}:5900"
-          echo "Protocol : VNC"
-          echo "Username : leave blank"
-          echo "Password : your VNC_PASSWORD GitHub secret"
-          echo "================================================"
+          echo "=================================================="
+          echo " TEMPORARY MACOS VNC DESKTOP IS READY"
+          echo "=================================================="
+          echo "Server       : ${TS_IP}:${TAILSCALE_VNC_PORT}"
+          echo "TigerVNC     : ${TS_IP}::${TAILSCALE_VNC_PORT}"
+          echo "Protocol     : VNC"
+          echo "Security     : VNC password authentication"
+          echo "Username     : leave blank"
+          echo "Password     : value of VNC_PASSWORD secret"
+          echo "Direct port  : ${TS_IP}:${VNC_PORT}"
+          echo "Forward port : ${TS_IP}:${TAILSCALE_VNC_PORT}"
+          echo "=================================================="
+          echo
+          echo "Recommended Ubuntu command:"
+          echo
+          echo "vncviewer -SecurityTypes=VncAuth ${TS_IP}::${TAILSCALE_VNC_PORT}"
+          echo
 
           {
-            echo "## macOS VNC desktop"
+            echo "## Temporary macOS VNC desktop"
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Server | \`${TS_IP}:5900\` |"
+            echo "| Server | \`${TS_IP}:${TAILSCALE_VNC_PORT}\` |"
+            echo "| TigerVNC address | \`${TS_IP}::${TAILSCALE_VNC_PORT}\` |"
             echo "| Protocol | VNC |"
             echo "| Username | Leave blank |"
             echo "| Password | Value stored in \`VNC_PASSWORD\` |"
-            echo "| Runner | \`macos-14\` |"
+            echo "| Direct VNC port | \`${TS_IP}:${VNC_PORT}\` |"
+            echo "| Forwarded VNC port | \`${TS_IP}:${TAILSCALE_VNC_PORT}\` |"
+            echo
+            echo "### Ubuntu command"
+            echo
+            echo "\`\`\`bash"
+            echo "vncviewer -SecurityTypes=VncAuth ${TS_IP}::${TAILSCALE_VNC_PORT}"
+            echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep macOS running
+      # -------------------------------------------------------------
+      # 11. KEEP RUNNER ACTIVE
+      # -------------------------------------------------------------
+      - name: Keep macOS VNC session running
         shell: bash
         run: |
+          set -Eeuo pipefail
+
           caffeinate -dimsu &
           CAFFEINATE_PID=$!
 
           cleanup() {
+            echo "Stopping keep-alive process..."
             kill "$CAFFEINATE_PID" 2>/dev/null || true
           }
 
           trap cleanup EXIT INT TERM
 
-          echo "macOS VNC is active."
-          echo "Cancel the workflow when finished."
+          echo "Temporary macOS VNC desktop is active."
+          echo "Cancel this workflow manually when finished."
+          echo
 
           while true; do
-            echo "VNC alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "VNC session alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Tailscale IP: $(tailscale ip -4 | head -n 1)"
             sleep 300
           done
