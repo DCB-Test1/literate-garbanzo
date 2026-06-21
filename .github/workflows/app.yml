@@ -1,7 +1,4 @@
-```yaml
-# .github/workflows/macos-vnc-cloudflare.yml
-
-name: macOS Desktop via Cloudflare
+name: mac
 
 on:
   workflow_dispatch:
@@ -10,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-cloudflare-desktop
+  group: mac
   cancel-in-progress: true
 
 jobs:
@@ -1143,4 +1140,3 @@ jobs:
 
             sleep 300
           done
-```
