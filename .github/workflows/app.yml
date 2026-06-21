@@ -1,0 +1,170 @@
+name: Temporary macOS VNC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-macos-vnc
+  cancel-in-progress: true
+
+jobs:
+  macos-vnc:
+    # Pinning is more predictable than macos-latest.
+    runs-on: macos-15
+
+    # Stop automatically after 3 hours.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show macOS and Xcode versions
+        shell: bash
+        run: |
+          echo "=== macOS ==="
+          sw_vers
+
+          echo
+          echo "=== Hardware ==="
+          uname -m
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+
+          echo
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcode-select -p
+
+          echo
+          echo "=== Current user ==="
+          whoami
+          id
+
+      - name: Connect the Mac to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          version: latest
+
+      - name: Configure macOS VNC
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${VNC_PASSWORD:-}" ]]; then
+            echo "::error::The VNC_PASSWORD repository secret is missing."
+            exit 1
+          fi
+
+          if [[ ${#VNC_PASSWORD} -ne 8 ]]; then
+            echo "::error::VNC_PASSWORD must be exactly 8 characters."
+            exit 1
+          fi
+
+          echo "::add-mask::$VNC_PASSWORD"
+
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+
+          if [[ ! -x "$KICKSTART" ]]; then
+            echo "::error::Apple Remote Desktop kickstart utility was not found."
+            exit 1
+          fi
+
+          echo "Setting a temporary password for the runner account..."
+          sudo dscl . -passwd /Users/runner "$VNC_PASSWORD"
+
+          echo "Enabling Apple Remote Desktop and legacy VNC..."
+          sudo "$KICKSTART" \
+            -configure \
+            -allowAccessFor -allUsers \
+            -privs -all
+
+          sudo "$KICKSTART" \
+            -configure \
+            -clientopts \
+            -setvnclegacy \
+            -vnclegacy yes
+
+          sudo "$KICKSTART" \
+            -configure \
+            -clientopts \
+            -setvncpw \
+            -vncpw "$VNC_PASSWORD"
+
+          sudo "$KICKSTART" -activate
+          sudo "$KICKSTART" -restart -agent -console
+
+          sleep 5
+
+          echo
+          echo "Checking VNC port..."
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || {
+            echo "::warning::Nothing appears to be listening on TCP port 5900."
+          }
+
+      - name: Open the Flutter project in Xcode
+        shell: bash
+        run: |
+          if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
+            open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
+          elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
+            open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
+          else
+            open -a Xcode || true
+          fi
+
+          open -a Simulator || true
+
+      - name: Print VNC connection details
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Could not determine the Tailscale IP."
+            exit 1
+          fi
+
+          echo
+          echo "=============================================="
+          echo " TEMPORARY MACOS VNC IS READY"
+          echo "=============================================="
+          echo "Address : $TS_IP:5900"
+          echo "Username: runner"
+          echo "Password: use your VNC_PASSWORD GitHub secret"
+          echo "Protocol: VNC"
+          echo "=============================================="
+
+          {
+            echo "## Temporary macOS VNC"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Address | \`$TS_IP:5900\` |"
+            echo "| Username | \`runner\` |"
+            echo "| Password | Value stored in \`VNC_PASSWORD\` |"
+            echo "| Protocol | VNC |"
+            echo
+            echo "The Ubuntu computer must be connected to the same Tailscale network."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the Mac running
+        shell: bash
+        run: |
+          echo "The temporary Mac will remain active until:"
+          echo "1. You cancel this workflow, or"
+          echo "2. The 180-minute timeout is reached."
+          echo
+          echo "Do not close this step while using VNC."
+
+          while true; do
+            echo "VNC session active: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            sleep 300
+          done
