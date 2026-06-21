@@ -1,3 +1,6 @@
+```yaml
+# .github/workflows/macos-vnc-cloudflare.yml
+
 name: macOS Desktop via Cloudflare
 
 on:
@@ -19,16 +22,23 @@ jobs:
       VNC_PORT: "5900"
       NOVNC_PORT: "6080"
 
+      # Lower values reduce bandwidth and improve responsiveness.
+      NOVNC_QUALITY: "3"
+      NOVNC_COMPRESSION: "2"
+
+      # The workflow tries these resolutions in order.
+      TARGET_RESOLUTION: "1280x800"
+
+      # Temporary GUI administrator account.
+      MAC_ADMIN_USER: "macadmin"
+
     steps:
-      # ---------------------------------------------------------
-      # CHECKOUT
-      # ---------------------------------------------------------
+      # =========================================================
+      # ENVIRONMENT
+      # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # ENVIRONMENT INFORMATION
-      # ---------------------------------------------------------
       - name: Show macOS environment
         shell: bash
         run: |
@@ -63,9 +73,255 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
-      # ---------------------------------------------------------
-      # ENABLE SCREEN SHARING AND LEGACY VNC
-      # ---------------------------------------------------------
+      # =========================================================
+      # TEMPORARY ADMINISTRATOR
+      # =========================================================
+      - name: Create temporary macadmin account
+        shell: bash
+        env:
+          MAC_ADMIN_PASSWORD_SECRET: ${{ secrets.MAC_ADMIN_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          ADMIN_USER="$MAC_ADMIN_USER"
+
+          # When MAC_ADMIN_PASSWORD is not configured, use macadmin.
+          ADMIN_PASSWORD="${MAC_ADMIN_PASSWORD_SECRET:-macadmin}"
+
+          echo "::add-mask::$ADMIN_PASSWORD"
+
+          echo "Creating temporary administrator: $ADMIN_USER"
+
+          if id "$ADMIN_USER" >/dev/null 2>&1; then
+            echo "Removing an existing temporary account..."
+            sudo sysadminctl \
+              -deleteUser "$ADMIN_USER" \
+              2>/dev/null || true
+
+            sleep 2
+          fi
+
+          sudo sysadminctl \
+            -addUser "$ADMIN_USER" \
+            -fullName "Temporary Mac Administrator" \
+            -password "$ADMIN_PASSWORD" \
+            -admin
+
+          sudo dseditgroup \
+            -o edit \
+            -a "$ADMIN_USER" \
+            -t user \
+            admin
+
+          sudo createhomedir \
+            -c \
+            -u "$ADMIN_USER" \
+            >/dev/null 2>&1 || true
+
+          echo "Testing administrator credentials..."
+
+          if ! sudo dscl . \
+            -authonly \
+            "$ADMIN_USER" \
+            "$ADMIN_PASSWORD"; then
+
+            echo "::error::Temporary administrator authentication failed."
+            exit 1
+          fi
+
+          echo
+          echo "=============================================="
+          echo " TEMPORARY ADMINISTRATOR READY"
+          echo "=============================================="
+          echo "Username : $ADMIN_USER"
+          echo "Password : MAC_ADMIN_PASSWORD secret"
+          echo "           or 'macadmin' when secret is absent"
+          echo "=============================================="
+
+          {
+            echo "## Temporary administrator"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Username | \`$ADMIN_USER\` |"
+            echo "| Password | \`MAC_ADMIN_PASSWORD\` secret, or \`macadmin\` when unset |"
+            echo
+            echo "Use this account in macOS installer authorization dialogs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # =========================================================
+      # REQUIRED UTILITIES
+      # =========================================================
+      - name: Install Cloudflare and display tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          export HOMEBREW_NO_ENV_HINTS=1
+
+          PACKAGES=()
+
+          if ! command -v cloudflared >/dev/null 2>&1; then
+            PACKAGES+=("cloudflared")
+          fi
+
+          if ! command -v displayplacer >/dev/null 2>&1; then
+            PACKAGES+=("displayplacer")
+          fi
+
+          if [[ "${#PACKAGES[@]}" -gt 0 ]]; then
+            brew install "${PACKAGES[@]}"
+          fi
+
+          echo
+          echo "=== cloudflared ==="
+          cloudflared --version
+
+          echo
+          echo "=== displayplacer ==="
+          displayplacer list | head -n 80 || true
+
+      # =========================================================
+      # PERFORMANCE OPTIMIZATION
+      # =========================================================
+      - name: Optimize macOS for remote desktop
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Disabling bandwidth-heavy macOS animations..."
+
+          defaults write NSGlobalDomain \
+            NSAutomaticWindowAnimationsEnabled \
+            -bool false || true
+
+          defaults write NSGlobalDomain \
+            NSWindowResizeTime \
+            -float 0.001 || true
+
+          defaults write NSGlobalDomain \
+            NSScrollAnimationEnabled \
+            -bool false || true
+
+          defaults write NSGlobalDomain \
+            NSUseAnimatedFocusRing \
+            -bool false || true
+
+          defaults write com.apple.dock \
+            launchanim \
+            -bool false || true
+
+          defaults write com.apple.dock \
+            expose-animation-duration \
+            -float 0.05 || true
+
+          defaults write com.apple.dock \
+            autohide-time-modifier \
+            -float 0.05 || true
+
+          defaults write com.apple.finder \
+            DisableAllAnimations \
+            -bool true || true
+
+          defaults write com.apple.universalaccess \
+            reduceMotion \
+            -bool true || true
+
+          defaults write com.apple.universalaccess \
+            reduceTransparency \
+            -bool true || true
+
+          killall Dock 2>/dev/null || true
+          killall Finder 2>/dev/null || true
+          killall SystemUIServer 2>/dev/null || true
+
+          sleep 3
+
+      - name: Reduce virtual display resolution
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Display configuration before optimization ==="
+
+          DISPLAY_INFO="$(displayplacer list)"
+          printf '%s\n' "$DISPLAY_INFO"
+
+          SCREEN_ID="$(
+            printf '%s\n' "$DISPLAY_INFO" |
+            awk -F': ' '
+              /Contextual screen id:/ {
+                print $2
+                exit
+              }
+            '
+          )"
+
+          if [[ -z "$SCREEN_ID" ]]; then
+            SCREEN_ID="$(
+              printf '%s\n' "$DISPLAY_INFO" |
+              awk -F': ' '
+                /Persistent screen id:/ {
+                  print $2
+                  exit
+                }
+              '
+            )"
+          fi
+
+          if [[ -z "$SCREEN_ID" ]]; then
+            echo "::warning::Unable to identify the virtual display."
+            echo "::warning::Continuing with the existing resolution."
+            exit 0
+          fi
+
+          echo
+          echo "Screen ID: $SCREEN_ID"
+
+          RESOLUTION_CHANGED=0
+
+          # Prefer 1280x800. Fall back to other low-bandwidth sizes.
+          for RESOLUTION in \
+            "$TARGET_RESOLUTION" \
+            "1280x720" \
+            "1024x768" \
+            "1440x900"; do
+
+            if ! printf '%s\n' "$DISPLAY_INFO" |
+              grep -q "res:${RESOLUTION}"; then
+              echo "Resolution ${RESOLUTION} is not advertised."
+              continue
+            fi
+
+            echo "Trying resolution ${RESOLUTION}..."
+
+            if displayplacer \
+              "id:${SCREEN_ID} res:${RESOLUTION} scaling:off origin:(0,0) degree:0"; then
+
+              echo "Display changed to ${RESOLUTION}."
+              RESOLUTION_CHANGED=1
+
+              echo "ACTIVE_RESOLUTION=$RESOLUTION" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+
+          if [[ "$RESOLUTION_CHANGED" -ne 1 ]]; then
+            echo "::warning::Could not apply a lower resolution."
+            echo "::warning::Continuing with the current display mode."
+            echo "ACTIVE_RESOLUTION=current" >> "$GITHUB_ENV"
+          fi
+
+          sleep 5
+
+          echo
+          echo "=== Display configuration after optimization ==="
+
+          displayplacer list | head -n 80 || true
+
+      # =========================================================
+      # MACOS SCREEN SHARING / VNC
+      # =========================================================
       - name: Configure macOS Screen Sharing
         shell: bash
         env:
@@ -89,13 +345,16 @@ jobs:
           try:
               raw = password.encode("ascii")
           except UnicodeEncodeError:
-              print("::error::VNC_PASSWORD must contain ASCII characters only.")
+              print(
+                  "::error::VNC_PASSWORD must contain ASCII "
+                  "characters only."
+              )
               sys.exit(1)
 
           if len(raw) != 8:
               print(
-                  "::error::VNC_PASSWORD must be exactly 8 ASCII characters. "
-                  f"Received {len(raw)} bytes."
+                  "::error::VNC_PASSWORD must be exactly 8 ASCII "
+                  f"characters. Received {len(raw)} bytes."
               )
               sys.exit(1)
 
@@ -105,7 +364,9 @@ jobs:
           sudo -n true
 
           TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+
           SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
 
           if [[ ! -f "$TCC_DB" ]]; then
@@ -114,7 +375,7 @@ jobs:
           fi
 
           if [[ ! -x "$KICKSTART" ]]; then
-            echo "::error::Apple Remote Desktop kickstart utility was not found."
+            echo "::error::Apple Remote Desktop kickstart was not found."
             exit 1
           fi
 
@@ -136,7 +397,8 @@ jobs:
           echo
           echo "=== Loading Screen Sharing service ==="
 
-          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl enable \
+            system/com.apple.screensharing || true
 
           sudo launchctl bootstrap \
             system \
@@ -228,15 +490,15 @@ jobs:
             "
 
           echo
-          echo "=== Restarting TCC services ==="
+          echo "=== Restarting TCC ==="
 
           sudo killall tccd 2>/dev/null || true
           killall tccd 2>/dev/null || true
 
-          sleep 4
+          sleep 3
 
           echo
-          echo "=== Stopping previous Screen Sharing services ==="
+          echo "=== Stopping previous Screen Sharing processes ==="
 
           sudo "$KICKSTART" -deactivate || true
           sudo killall ARDAgent 2>/dev/null || true
@@ -292,9 +554,10 @@ jobs:
             -bool true
 
           echo
-          echo "=== Starting Screen Sharing services ==="
+          echo "=== Starting Screen Sharing ==="
 
-          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl enable \
+            system/com.apple.screensharing || true
 
           sudo launchctl kickstart \
             -k \
@@ -304,29 +567,27 @@ jobs:
           sudo "$KICKSTART" -restart -agent -console || \
             sudo "$KICKSTART" -restart -agent || true
 
-          sleep 12
-
           echo
           echo "=== Waiting for VNC port ${VNC_PORT} ==="
 
-          READY=0
+          VNC_READY=0
 
-          for attempt in {1..30}; do
+          for ATTEMPT in 1 2 3; do
             if nc -z 127.0.0.1 "$VNC_PORT"; then
-              READY=1
+              VNC_READY=1
               echo "VNC is listening on localhost:${VNC_PORT}."
               break
             fi
 
-            echo "Attempt ${attempt}/30: waiting for VNC..."
-            sleep 2
+            echo "Attempt ${ATTEMPT}/3: waiting for VNC..."
+            sleep 10
           done
 
-          if [[ "$READY" -ne 1 ]]; then
-            echo "::error::VNC did not start on port ${VNC_PORT}."
+          if [[ "$VNC_READY" -ne 1 ]]; then
+            echo "::error::VNC did not start after 3 attempts."
 
             echo
-            echo "=== Related processes ==="
+            echo "=== Screen Sharing processes ==="
 
             ps aux |
               grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
@@ -341,13 +602,6 @@ jobs:
           fi
 
           echo
-          echo "=== VNC processes ==="
-
-          ps aux |
-            grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
-            grep -v grep || true
-
-          echo
           echo "=== VNC listener ==="
 
           sudo lsof \
@@ -355,9 +609,9 @@ jobs:
             -iTCP:"$VNC_PORT" \
             -sTCP:LISTEN || true
 
-      # ---------------------------------------------------------
-      # VERIFY VNC SECURITY TYPES
-      # ---------------------------------------------------------
+      # =========================================================
+      # VERIFY VNC AUTHENTICATION
+      # =========================================================
       - name: Verify VNC authentication types
         shell: bash
         run: |
@@ -396,7 +650,6 @@ jobs:
                   print("::error::Invalid VNC protocol banner.")
                   sys.exit(1)
 
-              # Negotiate standard RFB 3.8 even though Apple announces 3.889.
               sock.sendall(b"RFB 003.008\n")
 
               security_count = receive_exact(sock, 1)[0]
@@ -427,7 +680,7 @@ jobs:
 
               print("Advertised security types:", security_types)
               print("Type 2  = standard VNC password")
-              print("Type 30 = Apple Remote Desktop authentication")
+              print("Type 30 = Apple Remote Desktop")
 
               if 2 not in security_types:
                   print(
@@ -436,16 +689,10 @@ jobs:
                   )
                   sys.exit(1)
 
-              print(
-                  "Standard VNC password authentication type 2 "
-                  "is available."
-              )
+              print("Standard VNC password authentication is available.")
           PY
 
-      # ---------------------------------------------------------
-      # VERIFY DESKTOP SCREEN CAPTURE
-      # ---------------------------------------------------------
-      - name: Verify desktop screen capture
+      - name: Verify desktop capture
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -463,17 +710,9 @@ jobs:
           ls -lh "$SCREENSHOT"
           file "$SCREENSHOT"
 
-      - name: Upload desktop screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-desktop
-          path: ${{ runner.temp }}/macos-desktop.png
-          if-no-files-found: error
-          retention-days: 1
-
-      # ---------------------------------------------------------
-      # INSTALL PINNED NOVNC AND FORCE STANDARD VNC AUTH
-      # ---------------------------------------------------------
+      # =========================================================
+      # INSTALL AND PATCH NOVNC
+      # =========================================================
       - name: Install and patch noVNC
         shell: bash
         run: |
@@ -481,18 +720,19 @@ jobs:
 
           NOVNC_DIR="$RUNNER_TEMP/noVNC"
 
-          # Official noVNC 1.7.0 release commit.
           NOVNC_COMMIT="63107bd06d9e1f6136ff21aeda8cd62cbf0d433e"
           NOVNC_REPOSITORY="https://github.com/novnc/noVNC.git"
 
           rm -rf "$NOVNC_DIR"
           mkdir -p "$NOVNC_DIR"
 
-          echo "Downloading noVNC commit:"
+          echo "Downloading pinned noVNC commit:"
           echo "$NOVNC_COMMIT"
 
           git -C "$NOVNC_DIR" init
-          git -C "$NOVNC_DIR" remote add origin "$NOVNC_REPOSITORY"
+          git -C "$NOVNC_DIR" remote add \
+            origin \
+            "$NOVNC_REPOSITORY"
 
           git -C "$NOVNC_DIR" fetch \
             --depth=1 \
@@ -511,12 +751,12 @@ jobs:
           NOVNC_RFB="$NOVNC_DIR/core/rfb.js"
 
           if [[ ! -f "$NOVNC_RFB" ]]; then
-            echo "::error::Missing noVNC source file: $NOVNC_RFB"
+            echo "::error::Missing noVNC source: $NOVNC_RFB"
             exit 1
           fi
 
           echo
-          echo "Patching noVNC to prefer security type 2..."
+          echo "Patching noVNC to prefer standard VNC authentication..."
 
           NOVNC_RFB="$NOVNC_RFB" python3 <<'PY'
           import os
@@ -564,7 +804,6 @@ jobs:
               )
               sys.exit(1)
 
-          # Include indentation before the comment.
           selection_start = source.rfind(
               "\n",
               method_start,
@@ -590,10 +829,8 @@ jobs:
 
           replacement = """        // Prefer classic VNC password authentication.
                   //
-                  // Apple's VNC server normally advertises Apple Remote
-                  // Desktop authentication before classic VNC auth.
-                  // The GitHub workflow configures a temporary classic
-                  // VNC password, so explicitly select security type 2.
+                  // Apple normally advertises Apple Remote Desktop
+                  // authentication before standard VNC authentication.
                   this._rfbAuthScheme = -1;
 
                   if (Array.from(types).includes(securityTypeVNCAuth)) {
@@ -624,11 +861,11 @@ jobs:
               encoding="utf-8",
           )
 
-          print("noVNC security-selection patch applied.")
+          print("noVNC authentication patch applied.")
           PY
 
           echo
-          echo "=== Confirming patch ==="
+          echo "=== Confirming authentication patch ==="
 
           grep \
             -n \
@@ -644,10 +881,10 @@ jobs:
 
           echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------
-      # START NOVNC / WEBSOCKIFY
-      # ---------------------------------------------------------
-      - name: Start noVNC
+      # =========================================================
+      # START NOVNC
+      # =========================================================
+      - name: Start optimized noVNC
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -663,77 +900,48 @@ jobs:
           echo "NOVNC_PID=$NOVNC_PID" >> "$GITHUB_ENV"
           echo "$NOVNC_PID" > "$RUNNER_TEMP/novnc.pid"
 
-          echo "Waiting for noVNC..."
+          NOVNC_READY=0
 
-          READY=0
-
-          for attempt in {1..45}; do
+          for ATTEMPT in 1 2 3; do
             if curl \
               --silent \
               --fail \
               "http://127.0.0.1:${NOVNC_PORT}/vnc.html" \
               >/dev/null; then
 
-              READY=1
+              NOVNC_READY=1
               echo "noVNC is ready."
               break
             fi
 
             if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
               echo "::error::noVNC stopped unexpectedly."
-
-              echo
-              echo "=== noVNC log ==="
-
               cat "$RUNNER_TEMP/novnc.log" || true
               exit 1
             fi
 
-            echo "Attempt ${attempt}/45: waiting for noVNC..."
-            sleep 2
+            echo "Attempt ${ATTEMPT}/3: waiting for noVNC..."
+            sleep 5
           done
 
-          if [[ "$READY" -ne 1 ]]; then
-            echo "::error::noVNC did not become ready."
-
-            echo
-            echo "=== noVNC log ==="
-
+          if [[ "$NOVNC_READY" -ne 1 ]]; then
+            echo "::error::noVNC did not start after 3 attempts."
             cat "$RUNNER_TEMP/novnc.log" || true
             exit 1
           fi
 
-          echo
-          echo "=== noVNC log ==="
-
-          cat "$RUNNER_TEMP/novnc.log" || true
-
-      # ---------------------------------------------------------
-      # INSTALL CLOUDFLARED
-      # ---------------------------------------------------------
-      - name: Install Cloudflare Tunnel
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          export HOMEBREW_NO_ENV_HINTS=1
-
-          if ! command -v cloudflared >/dev/null 2>&1; then
-            brew install cloudflared
-          fi
-
-          echo
-          echo "=== cloudflared version ==="
-
-          cloudflared --version
-
-      # ---------------------------------------------------------
-      # START FREE CLOUDFLARE QUICK TUNNEL
-      # ---------------------------------------------------------
+      # =========================================================
+      # START CLOUDFLARE QUICK TUNNEL
+      # =========================================================
       - name: Start Cloudflare Quick Tunnel
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          # Quick Tunnels do not work when a local cloudflared
+          # configuration file is present.
+          rm -f "$HOME/.cloudflared/config.yml"
+          rm -f "$HOME/.cloudflared/config.yaml"
 
           nohup cloudflared tunnel \
             --url "http://127.0.0.1:${NOVNC_PORT}" \
@@ -746,11 +954,9 @@ jobs:
           echo "CLOUDFLARED_PID=$CLOUDFLARED_PID" >> "$GITHUB_ENV"
           echo "$CLOUDFLARED_PID" > "$RUNNER_TEMP/cloudflared.pid"
 
-          echo "Waiting for Cloudflare Quick Tunnel URL..."
-
           CF_URL=""
 
-          for attempt in {1..60}; do
+          for ATTEMPT in 1 2 3; do
             CF_URL="$(
               grep \
                 -Eo \
@@ -760,48 +966,50 @@ jobs:
             )"
 
             if [[ -n "$CF_URL" ]]; then
+              echo "Cloudflare Quick Tunnel created:"
+              echo "$CF_URL"
               break
             fi
 
             if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
               echo "::error::cloudflared stopped unexpectedly."
-
-              echo
-              echo "=== cloudflared log ==="
-
               cat "$RUNNER_TEMP/cloudflared.log" || true
               exit 1
             fi
 
-            echo "Attempt ${attempt}/60: waiting for tunnel URL..."
-            sleep 2
+            echo "Attempt ${ATTEMPT}/3: waiting for tunnel URL..."
+            sleep 10
           done
 
           if [[ -z "$CF_URL" ]]; then
-            echo "::error::Cloudflare Quick Tunnel URL was not created."
-
-            echo
-            echo "=== cloudflared log ==="
-
+            echo "::error::Cloudflare URL was not created after 3 attempts."
             cat "$RUNNER_TEMP/cloudflared.log" || true
             exit 1
           fi
 
-          NOVNC_URL="${CF_URL}/vnc.html?autoconnect=true&resize=scale&path=websockify&logging=debug"
+          NOVNC_URL="${CF_URL}/vnc.html"
+
+          NOVNC_URL+="?autoconnect=1"
+          NOVNC_URL+="&reconnect=1"
+          NOVNC_URL+="&reconnect_delay=1000"
+          NOVNC_URL+="&resize=scale"
+          NOVNC_URL+="&quality=${NOVNC_QUALITY}"
+          NOVNC_URL+="&compression=${NOVNC_COMPRESSION}"
+          NOVNC_URL+="&shared=1"
+          NOVNC_URL+="&bell=0"
+          NOVNC_URL+="&logging=warn"
+          NOVNC_URL+="&keep_device_awake=1"
+          NOVNC_URL+="&path=websockify"
 
           echo "CF_URL=$CF_URL" >> "$GITHUB_ENV"
           echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
-
-          echo
-          echo "Cloudflare Quick Tunnel created:"
-          echo "$CF_URL"
 
           echo
           echo "Waiting for public noVNC page..."
 
           PUBLIC_READY=0
 
-          for attempt in {1..30}; do
+          for ATTEMPT in 1 2 3; do
             if curl \
               --silent \
               --fail \
@@ -813,18 +1021,19 @@ jobs:
               break
             fi
 
-            echo "Attempt ${attempt}/30: waiting for public page..."
-            sleep 3
+            echo "Attempt ${ATTEMPT}/3: waiting for public page..."
+            sleep 5
           done
 
           if [[ "$PUBLIC_READY" -ne 1 ]]; then
-            echo "::warning::Tunnel exists, but the public page was not ready yet."
+            echo "::warning::Public page was not ready after 3 attempts."
+            echo "::warning::The URL may still become available shortly."
           fi
 
-      # ---------------------------------------------------------
-      # PRINT CONNECTION INFORMATION
-      # ---------------------------------------------------------
-      - name: Print browser connection details
+      # =========================================================
+      # CONNECTION DETAILS
+      # =========================================================
+      - name: Print connection details
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -836,10 +1045,18 @@ jobs:
           echo
           echo "$NOVNC_URL"
           echo
-          echo "Username : leave blank"
-          echo "Password : value stored in VNC_PASSWORD"
+          echo "VNC username : leave blank"
+          echo "VNC password : value stored in VNC_PASSWORD"
           echo
-          echo "Authentication: standard VNC password"
+          echo "Installer username : macadmin"
+          echo "Installer password : MAC_ADMIN_PASSWORD secret"
+          echo "                     or macadmin when secret is absent"
+          echo
+          echo "Resolution  : ${ACTIVE_RESOLUTION:-current}"
+          echo "Quality     : ${NOVNC_QUALITY}/9"
+          echo "Compression : ${NOVNC_COMPRESSION}/9"
+          echo
+          echo "Cancel the workflow when finished."
           echo "======================================================"
 
           {
@@ -847,19 +1064,34 @@ jobs:
             echo
             echo "**[$NOVNC_URL]($NOVNC_URL)**"
             echo
+            echo "### VNC login"
+            echo
             echo "| Setting | Value |"
             echo "|---|---|"
             echo "| Username | Leave blank |"
             echo "| Password | Value stored in \`VNC_PASSWORD\` |"
-            echo "| Authentication | Standard VNC password |"
-            echo "| Transport | Cloudflare HTTPS and noVNC |"
+            echo
+            echo "### macOS installer authorization"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Username | \`macadmin\` |"
+            echo "| Password | \`MAC_ADMIN_PASSWORD\` secret, or \`macadmin\` |"
+            echo
+            echo "### Performance"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Resolution | \`${ACTIVE_RESOLUTION:-current}\` |"
+            echo "| noVNC quality | \`${NOVNC_QUALITY}/9\` |"
+            echo "| noVNC compression | \`${NOVNC_COMPRESSION}/9\` |"
             echo
             echo "Cancel the workflow when finished."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------------------------------------------------------
-      # KEEP THE TEMPORARY MAC RUNNING
-      # ---------------------------------------------------------
+      # =========================================================
+      # KEEP SESSION ACTIVE
+      # =========================================================
       - name: Keep macOS desktop running
         shell: bash
         run: |
@@ -888,35 +1120,27 @@ jobs:
 
           trap cleanup EXIT INT TERM
 
-          echo "macOS browser desktop is active."
+          echo "macOS desktop is active:"
           echo "$NOVNC_URL"
-          echo
-          echo "Cancel this workflow when finished."
 
           while true; do
             if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
               echo "::error::Cloudflare Tunnel stopped."
-
-              echo
-              echo "=== cloudflared log ==="
-
               cat "$RUNNER_TEMP/cloudflared.log" || true
               exit 1
             fi
 
             if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
               echo "::error::noVNC stopped."
-
-              echo
-              echo "=== noVNC log ==="
-
               cat "$RUNNER_TEMP/novnc.log" || true
               exit 1
             fi
 
             echo
             echo "Desktop alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Resolution: ${ACTIVE_RESOLUTION:-current}"
             echo "URL: $NOVNC_URL"
 
             sleep 300
           done
+```
