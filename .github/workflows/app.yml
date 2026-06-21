@@ -1,4 +1,4 @@
-name: Temporary macOS VNC Desktop
+name: Temporary macOS VNC via ngrok
 
 on:
   workflow_dispatch:
@@ -7,29 +7,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporary-macos-vnc
+  group: temporary-macos-vnc-ngrok
   cancel-in-progress: true
 
 jobs:
   macos-vnc:
-    # This TCC workaround is confirmed against the macOS 14 runner.
     runs-on: macos-14
     timeout-minutes: 180
 
     env:
       VNC_PORT: "5900"
-      TAILSCALE_VNC_PORT: "5901"
 
     steps:
-      # -------------------------------------------------------------
-      # 1. CHECKOUT
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # CHECKOUT
+      # -----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -------------------------------------------------------------
-      # 2. RUNNER INFORMATION
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # RUNNER DETAILS
+      # -----------------------------------------------------------
       - name: Show macOS environment
         shell: bash
         run: |
@@ -65,7 +63,7 @@ jobs:
           xcode-select -p
 
           echo
-          echo "=== Available Xcode applications ==="
+          echo "=== Xcode applications ==="
           find /Applications \
             -maxdepth 1 \
             -type d \
@@ -73,41 +71,9 @@ jobs:
             -print \
             | sort
 
-      # -------------------------------------------------------------
-      # 3. CONNECT TO TAILSCALE
-      # -------------------------------------------------------------
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-          version: latest
-
-      - name: Verify Tailscale connection
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "=== Tailscale status ==="
-          tailscale status
-
-          echo
-          echo "=== Tailscale IPv4 ==="
-          tailscale ip -4
-
-          TS_IP="$(tailscale ip -4 | head -n 1)"
-
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Tailscale did not assign an IPv4 address."
-            exit 1
-          fi
-
-          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-
-      # -------------------------------------------------------------
-      # 4. ENABLE SCREEN RECORDING + REMOTE CONTROL IN TCC
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # ENABLE VNC + TCC PERMISSIONS
+      # -----------------------------------------------------------
       - name: Configure macOS Screen Sharing and VNC
         shell: bash
         env:
@@ -120,7 +86,6 @@ jobs:
             exit 1
           fi
 
-          # Hide the password if a command accidentally prints it.
           echo "::add-mask::$VNC_PASSWORD"
 
           python3 <<'PY'
@@ -130,15 +95,15 @@ jobs:
           password = os.environ.get("VNC_PASSWORD", "")
 
           try:
-              encoded = password.encode("ascii")
+              raw = password.encode("ascii")
           except UnicodeEncodeError:
               print("::error::VNC_PASSWORD must contain ASCII characters only.")
               sys.exit(1)
 
-          if len(encoded) != 8:
+          if len(raw) != 8:
               print(
                   "::error::VNC_PASSWORD must be exactly 8 ASCII characters. "
-                  f"Received {len(encoded)} bytes."
+                  f"Received {len(raw)} bytes."
               )
               sys.exit(1)
 
@@ -152,25 +117,17 @@ jobs:
           SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
 
           if [[ ! -f "$TCC_DB" ]]; then
-            echo "::error::System TCC database does not exist: $TCC_DB"
+            echo "::error::TCC database not found: $TCC_DB"
             exit 1
           fi
 
           if [[ ! -x "$KICKSTART" ]]; then
-            echo "::error::Apple Remote Desktop kickstart utility was not found."
+            echo "::error::Apple Remote Desktop kickstart was not found."
             exit 1
           fi
 
           echo
-          echo "=== TCC database schema ==="
-
-          sudo sqlite3 "$TCC_DB" "PRAGMA table_info(access);" || {
-            echo "::error::Unable to read the system TCC database."
-            exit 1
-          }
-
-          echo
-          echo "=== Testing TCC database write access ==="
+          echo "=== Testing system TCC database ==="
 
           sudo sqlite3 "$TCC_DB" "
             BEGIN IMMEDIATE;
@@ -185,7 +142,7 @@ jobs:
           echo "System TCC database is writable."
 
           echo
-          echo "=== Loading Screen Sharing launch daemon ==="
+          echo "=== Loading Screen Sharing service ==="
 
           sudo launchctl enable system/com.apple.screensharing || true
 
@@ -197,7 +154,7 @@ jobs:
           EPOCH="$(date +%s)"
 
           echo
-          echo "=== Granting screen capture and remote-input access ==="
+          echo "=== Granting Screen Sharing TCC permissions ==="
 
           sudo sqlite3 "$TCC_DB" <<SQL
           BEGIN IMMEDIATE;
@@ -261,7 +218,7 @@ jobs:
           SQL
 
           echo
-          echo "=== Installed Screen Sharing TCC permissions ==="
+          echo "=== Installed TCC entries ==="
 
           sudo sqlite3 \
             -header \
@@ -286,13 +243,12 @@ jobs:
           sleep 4
 
           echo
-          echo "=== Stopping previous Remote Management processes ==="
+          echo "=== Stopping existing Remote Management processes ==="
 
           sudo "$KICKSTART" -deactivate || true
           sudo killall ARDAgent 2>/dev/null || true
           sudo killall ScreensharingAgent 2>/dev/null || true
           sudo killall screensharingd 2>/dev/null || true
-
           sleep 3
 
           echo
@@ -315,7 +271,7 @@ jobs:
             -vnclegacy yes
 
           echo
-          echo "=== Setting separate VNC password ==="
+          echo "=== Setting VNC password ==="
 
           sudo "$KICKSTART" \
             -configure \
@@ -324,42 +280,41 @@ jobs:
             -vncpw "$VNC_PASSWORD"
 
           echo
-          echo "=== Starting Screen Sharing components ==="
+          echo "=== Starting Screen Sharing ==="
 
           sudo launchctl enable system/com.apple.screensharing || true
           sudo launchctl kickstart -k system/com.apple.screensharing || true
-
           sudo "$KICKSTART" -restart -agent || true
 
           sleep 10
 
           echo
-          echo "=== Waiting for local VNC port ${VNC_PORT} ==="
+          echo "=== Waiting for VNC port ${VNC_PORT} ==="
 
           READY=0
 
           for attempt in {1..30}; do
             if nc -z 127.0.0.1 "$VNC_PORT"; then
-              echo "VNC is listening on 127.0.0.1:${VNC_PORT}."
+              echo "VNC is listening on localhost:${VNC_PORT}."
               READY=1
               break
             fi
 
-            echo "Attempt ${attempt}/30: VNC is not ready yet."
+            echo "Attempt ${attempt}/30: VNC not ready."
             sleep 2
           done
 
           if [[ "$READY" -ne 1 ]]; then
-            echo "::error::VNC did not start on port ${VNC_PORT}."
+            echo "::error::VNC did not start."
 
             echo
-            echo "=== Related processes ==="
+            echo "=== Processes ==="
             ps aux |
               grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
               grep -v grep || true
 
             echo
-            echo "=== Listening ports ==="
+            echo "=== Ports ==="
             sudo lsof -nP -iTCP -sTCP:LISTEN || true
 
             exit 1
@@ -373,56 +328,179 @@ jobs:
             grep -v grep || true
 
           echo
-          echo "=== VNC listener ==="
+          echo "=== Port 5900 listener ==="
 
           sudo lsof \
             -nP \
             -iTCP:"$VNC_PORT" \
             -sTCP:LISTEN || true
 
-      # -------------------------------------------------------------
-      # 5. FORWARD TAILSCALE PORT 5901 TO LOCAL VNC PORT 5900
-      # -------------------------------------------------------------
-      - name: Expose VNC through Tailscale Serve
+      # -----------------------------------------------------------
+      # VERIFY LOCAL VNC HANDSHAKE
+      # -----------------------------------------------------------
+      - name: Verify local VNC protocol
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "=== Confirming local VNC service ==="
+          echo "=== Port test ==="
           nc -vz 127.0.0.1 "$VNC_PORT"
 
           echo
-          echo "=== Resetting previous Tailscale Serve configuration ==="
-          sudo tailscale serve reset || true
+          echo "=== VNC protocol banner ==="
 
-          echo
-          echo "=== Creating raw TCP forwarder ==="
-          echo "Tailscale port ${TAILSCALE_VNC_PORT} -> localhost:${VNC_PORT}"
+          BANNER="$(
+            python3 - <<'PY'
+          import socket
 
-          sudo tailscale serve \
-            --bg \
-            --tcp="${TAILSCALE_VNC_PORT}" \
-            "tcp://127.0.0.1:${VNC_PORT}"
+          with socket.create_connection(("127.0.0.1", 5900), timeout=5) as sock:
+              print(sock.recv(32).decode("ascii", errors="replace").strip())
+          PY
+          )"
 
-          sleep 3
+          echo "$BANNER"
 
-          echo
-          echo "=== Tailscale Serve status ==="
-          sudo tailscale serve status
-
-          echo
-          echo "=== Testing forwarded VNC port from runner ==="
-
-          if nc -vz -w 10 "$TAILSCALE_IP" "$TAILSCALE_VNC_PORT"; then
-            echo "Forwarded VNC port is reachable."
-          else
-            echo "::warning::The runner could not test its own forwarded Tailscale port."
-            echo "::warning::Continue and test it from Ubuntu."
+          if [[ "$BANNER" != RFB* ]]; then
+            echo "::error::Port 5900 did not return an RFB/VNC protocol banner."
+            exit 1
           fi
 
-      # -------------------------------------------------------------
-      # 6. INSTALL FLUTTER
-      # -------------------------------------------------------------
+          echo "Local VNC protocol is responding."
+
+      # -----------------------------------------------------------
+      # INSTALL NGROK
+      # -----------------------------------------------------------
+      - name: Install ngrok
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if command -v ngrok >/dev/null 2>&1; then
+            echo "ngrok is already installed."
+          else
+            brew install ngrok/ngrok/ngrok
+          fi
+
+          echo
+          echo "=== ngrok version ==="
+          ngrok version
+
+      # -----------------------------------------------------------
+      # START PUBLIC NGROK TCP TUNNEL
+      # -----------------------------------------------------------
+      - name: Start ngrok TCP tunnel
+        shell: bash
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${NGROK_AUTHTOKEN:-}" ]]; then
+            echo "::error::NGROK_AUTHTOKEN GitHub secret is missing."
+            exit 1
+          fi
+
+          echo "::add-mask::$NGROK_AUTHTOKEN"
+
+          echo "Adding ngrok authtoken..."
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+          echo
+          echo "Starting ngrok TCP tunnel:"
+          echo "public TCP endpoint -> 127.0.0.1:${VNC_PORT}"
+
+          nohup ngrok tcp "127.0.0.1:${VNC_PORT}" \
+            --log=stdout \
+            --log-format=json \
+            > "$RUNNER_TEMP/ngrok.log" \
+            2>&1 &
+
+          NGROK_PID=$!
+
+          echo "NGROK_PID=$NGROK_PID" >> "$GITHUB_ENV"
+          echo "$NGROK_PID" > "$RUNNER_TEMP/ngrok.pid"
+
+          echo
+          echo "Waiting for the ngrok local API..."
+
+          API_READY=0
+
+          for attempt in {1..30}; do
+            if curl \
+              --silent \
+              --fail \
+              http://127.0.0.1:4040/api/tunnels \
+              >/dev/null; then
+              API_READY=1
+              break
+            fi
+
+            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+              echo "::error::ngrok stopped before creating the tunnel."
+              cat "$RUNNER_TEMP/ngrok.log" || true
+              exit 1
+            fi
+
+            echo "Attempt ${attempt}/30: waiting for ngrok..."
+            sleep 2
+          done
+
+          if [[ "$API_READY" -ne 1 ]]; then
+            echo "::error::ngrok API did not become ready."
+            cat "$RUNNER_TEMP/ngrok.log" || true
+            exit 1
+          fi
+
+          NGROK_URL="$(
+            curl \
+              --silent \
+              http://127.0.0.1:4040/api/tunnels |
+            python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+
+          for tunnel in payload.get("tunnels", []):
+              url = tunnel.get("public_url", "")
+              if url.startswith("tcp://"):
+                  print(url)
+                  break
+          '
+          )"
+
+          if [[ -z "$NGROK_URL" ]]; then
+            echo "::error::ngrok did not return a TCP public URL."
+
+            echo
+            echo "=== ngrok API response ==="
+            curl \
+              --silent \
+              http://127.0.0.1:4040/api/tunnels || true
+
+            echo
+            echo "=== ngrok log ==="
+            cat "$RUNNER_TEMP/ngrok.log" || true
+
+            exit 1
+          fi
+
+          NGROK_ADDRESS="${NGROK_URL#tcp://}"
+          NGROK_HOST="${NGROK_ADDRESS%:*}"
+          NGROK_PORT="${NGROK_ADDRESS##*:}"
+
+          echo "NGROK_URL=$NGROK_URL" >> "$GITHUB_ENV"
+          echo "NGROK_ADDRESS=$NGROK_ADDRESS" >> "$GITHUB_ENV"
+          echo "NGROK_HOST=$NGROK_HOST" >> "$GITHUB_ENV"
+          echo "NGROK_PORT=$NGROK_PORT" >> "$GITHUB_ENV"
+
+          echo
+          echo "ngrok tunnel created successfully."
+          echo "Public endpoint: $NGROK_ADDRESS"
+
+      # -----------------------------------------------------------
+      # OPTIONAL FLUTTER PREPARATION
+      # -----------------------------------------------------------
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -436,22 +514,16 @@ jobs:
           set -Eeuo pipefail
 
           flutter --version
-          flutter doctor -v || true
           flutter pub get
 
-          if [[ -d "$GITHUB_WORKSPACE/ios" ]]; then
+          if [[ -f "$GITHUB_WORKSPACE/ios/Podfile" ]]; then
             cd "$GITHUB_WORKSPACE/ios"
-
-            if [[ -f "Podfile" ]]; then
-              pod install --repo-update
-            else
-              echo "No ios/Podfile found; skipping pod install."
-            fi
+            pod install --repo-update
           fi
 
-      # -------------------------------------------------------------
-      # 7. OPEN XCODE, FINDER AND SIMULATOR
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # OPEN XCODE + SIMULATOR
+      # -----------------------------------------------------------
       - name: Open Xcode and Simulator
         shell: bash
         run: |
@@ -467,32 +539,27 @@ jobs:
           open -a Finder "$GITHUB_WORKSPACE" || true
 
           if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
-            echo "Opening ios/Runner.xcworkspace"
+            echo "Opening Runner.xcworkspace..."
             open "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
 
           elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
-            echo "Opening ios/Runner.xcodeproj"
+            echo "Opening Runner.xcodeproj..."
             open "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
 
           elif [[ -d "$XCODE_APP" ]]; then
-            echo "No Flutter iOS workspace found; opening Xcode directly."
+            echo "Opening Xcode application..."
             open "$XCODE_APP" || true
-
-          else
-            echo "::warning::Unable to locate the Xcode application."
           fi
 
           if [[ -d "$SIMULATOR_APP" ]]; then
             open "$SIMULATOR_APP" || true
-          else
-            echo "::warning::Simulator application was not found."
           fi
 
           sleep 15
 
-      # -------------------------------------------------------------
-      # 8. VERIFY SCREEN CAPTURE
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # VERIFY DESKTOP CAPTURE
+      # -----------------------------------------------------------
       - name: Capture desktop verification screenshot
         shell: bash
         run: |
@@ -507,7 +574,6 @@ jobs:
             exit 1
           fi
 
-          echo "Desktop screenshot created:"
           ls -lh "$SCREENSHOT"
           file "$SCREENSHOT"
 
@@ -519,97 +585,57 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # -------------------------------------------------------------
-      # 9. FINAL NETWORK DIAGNOSTICS
-      # -------------------------------------------------------------
-      - name: Print complete diagnostics
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "=== Tailscale status ==="
-          tailscale status
-
-          echo
-          echo "=== Tailscale addresses ==="
-          tailscale ip
-
-          echo
-          echo "=== Tailscale Serve ==="
-          sudo tailscale serve status
-
-          echo
-          echo "=== VNC local-port test ==="
-          nc -vz 127.0.0.1 "$VNC_PORT"
-
-          echo
-          echo "=== Listening VNC ports ==="
-          sudo lsof \
-            -nP \
-            -iTCP:"$VNC_PORT" \
-            -sTCP:LISTEN || true
-
-          echo
-          echo "=== Routes ==="
-          netstat -rn || true
-
-      # -------------------------------------------------------------
-      # 10. PRINT CONNECTION DETAILS
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # PRINT NGROK/VNC DETAILS
+      # -----------------------------------------------------------
       - name: Print VNC connection details
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          TS_IP="$(tailscale ip -4 | head -n 1)"
-
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Unable to obtain the Tailscale IPv4 address."
-            exit 1
-          fi
-
           echo
           echo "=================================================="
-          echo " TEMPORARY MACOS VNC DESKTOP IS READY"
+          echo " TEMPORARY MACOS VNC VIA NGROK IS READY"
           echo "=================================================="
-          echo "Server       : ${TS_IP}:${TAILSCALE_VNC_PORT}"
-          echo "TigerVNC     : ${TS_IP}::${TAILSCALE_VNC_PORT}"
+          echo "Server       : ${NGROK_ADDRESS}"
+          echo "Host         : ${NGROK_HOST}"
+          echo "Port         : ${NGROK_PORT}"
           echo "Protocol     : VNC"
-          echo "Security     : VNC password authentication"
           echo "Username     : leave blank"
           echo "Password     : value of VNC_PASSWORD secret"
-          echo "Direct port  : ${TS_IP}:${VNC_PORT}"
-          echo "Forward port : ${TS_IP}:${TAILSCALE_VNC_PORT}"
           echo "=================================================="
           echo
-          echo "Recommended Ubuntu command:"
+          echo "TigerVNC command:"
           echo
-          echo "vncviewer -SecurityTypes=VncAuth ${TS_IP}::${TAILSCALE_VNC_PORT}"
+          echo "vncviewer -SecurityTypes=VncAuth ${NGROK_HOST}::${NGROK_PORT}"
+          echo
+          echo "Remmina server:"
+          echo
+          echo "${NGROK_HOST}:${NGROK_PORT}"
           echo
 
           {
-            echo "## Temporary macOS VNC desktop"
+            echo "## Temporary macOS VNC via ngrok"
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Server | \`${TS_IP}:${TAILSCALE_VNC_PORT}\` |"
-            echo "| TigerVNC address | \`${TS_IP}::${TAILSCALE_VNC_PORT}\` |"
+            echo "| Server | \`${NGROK_ADDRESS}\` |"
+            echo "| Host | \`${NGROK_HOST}\` |"
+            echo "| Port | \`${NGROK_PORT}\` |"
             echo "| Protocol | VNC |"
             echo "| Username | Leave blank |"
             echo "| Password | Value stored in \`VNC_PASSWORD\` |"
-            echo "| Direct VNC port | \`${TS_IP}:${VNC_PORT}\` |"
-            echo "| Forwarded VNC port | \`${TS_IP}:${TAILSCALE_VNC_PORT}\` |"
             echo
-            echo "### Ubuntu command"
+            echo "### TigerVNC"
             echo
             echo "\`\`\`bash"
-            echo "vncviewer -SecurityTypes=VncAuth ${TS_IP}::${TAILSCALE_VNC_PORT}"
+            echo "vncviewer -SecurityTypes=VncAuth ${NGROK_HOST}::${NGROK_PORT}"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # -------------------------------------------------------------
-      # 11. KEEP RUNNER ACTIVE
-      # -------------------------------------------------------------
+      # -----------------------------------------------------------
+      # KEEP SESSION RUNNING
+      # -----------------------------------------------------------
       - name: Keep macOS VNC session running
         shell: bash
         run: |
@@ -619,18 +645,30 @@ jobs:
           CAFFEINATE_PID=$!
 
           cleanup() {
-            echo "Stopping keep-alive process..."
+            echo "Stopping keep-alive processes..."
+
             kill "$CAFFEINATE_PID" 2>/dev/null || true
+
+            if [[ -f "$RUNNER_TEMP/ngrok.pid" ]]; then
+              kill "$(cat "$RUNNER_TEMP/ngrok.pid")" 2>/dev/null || true
+            fi
           }
 
           trap cleanup EXIT INT TERM
 
-          echo "Temporary macOS VNC desktop is active."
-          echo "Cancel this workflow manually when finished."
+          echo "Temporary macOS VNC session is active."
+          echo "Cancel the GitHub workflow when finished."
           echo
 
           while true; do
-            echo "VNC session alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "Tailscale IP: $(tailscale ip -4 | head -n 1)"
+            echo "VNC alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "ngrok endpoint: ${NGROK_ADDRESS}"
+
+            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+              echo "::error::ngrok process stopped unexpectedly."
+              cat "$RUNNER_TEMP/ngrok.log" || true
+              exit 1
+            fi
+
             sleep 300
           done
