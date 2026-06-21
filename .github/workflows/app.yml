@@ -12,61 +12,82 @@ concurrency:
 
 jobs:
   macos-vnc:
-    # Pinning is more predictable than macos-latest.
+    # Pin macOS 15 because macos-latest is changing to macOS 26.
     runs-on: macos-15
-
-    # Stop automatically after 3 hours.
     timeout-minutes: 180
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show macOS and Xcode versions
+      - name: Show runner information
         shell: bash
         run: |
           echo "=== macOS ==="
           sw_vers
 
           echo
-          echo "=== Hardware ==="
+          echo "=== Architecture ==="
           uname -m
-          sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+
+          echo
+          echo "=== User ==="
+          whoami
+          id
 
           echo
           echo "=== Xcode ==="
           xcodebuild -version
           xcode-select -p
 
-          echo
-          echo "=== Current user ==="
-          whoami
-          id
-
-      - name: Connect the Mac to Tailscale
+      - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
           version: latest
 
-      - name: Configure macOS VNC
+      - name: Configure Apple VNC server
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           if [[ -z "${VNC_PASSWORD:-}" ]]; then
-            echo "::error::The VNC_PASSWORD repository secret is missing."
+            echo "::error::GitHub secret VNC_PASSWORD is missing."
             exit 1
           fi
 
-          if [[ ${#VNC_PASSWORD} -ne 8 ]]; then
-            echo "::error::VNC_PASSWORD must be exactly 8 characters."
-            exit 1
-          fi
-
+          # Prevent accidental password disclosure in logs.
           echo "::add-mask::$VNC_PASSWORD"
+
+          # Apple legacy VNC supports an 8-byte ASCII password.
+          python3 <<'PY'
+          import os
+          import sys
+
+          password = os.environ.get("VNC_PASSWORD", "")
+
+          try:
+              encoded = password.encode("ascii")
+          except UnicodeEncodeError:
+              print("::error::VNC_PASSWORD must contain ASCII characters only.")
+              sys.exit(1)
+
+          if len(encoded) != 8:
+              print(
+                  f"::error::VNC_PASSWORD must be exactly 8 ASCII characters; "
+                  f"received {len(encoded)} bytes."
+              )
+              sys.exit(1)
+
+          print("VNC password validation passed.")
+          PY
+
+          # GitHub's runner has passwordless sudo.
+          sudo -n true
 
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
 
@@ -75,96 +96,152 @@ jobs:
             exit 1
           fi
 
-          echo "Setting a temporary password for the runner account..."
-          sudo dscl . -passwd /Users/runner "$VNC_PASSWORD"
+          echo "Stopping any existing Remote Management service..."
+          sudo "$KICKSTART" -deactivate || true
 
-          echo "Enabling Apple Remote Desktop and legacy VNC..."
+          echo "Allowing remote-control access..."
           sudo "$KICKSTART" \
             -configure \
             -allowAccessFor -allUsers \
             -privs -all
 
+          echo "Enabling legacy VNC authentication..."
           sudo "$KICKSTART" \
             -configure \
             -clientopts \
             -setvnclegacy \
             -vnclegacy yes
 
+          echo "Setting the separate VNC password..."
           sudo "$KICKSTART" \
             -configure \
             -clientopts \
             -setvncpw \
             -vncpw "$VNC_PASSWORD"
 
+          echo "Starting Remote Management..."
           sudo "$KICKSTART" -activate
           sudo "$KICKSTART" -restart -agent -console
 
-          sleep 5
+          # Prevent the temporary machine from sleeping.
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+
+          echo "Waiting for VNC port 5900..."
+          python3 <<'PY'
+          import socket
+          import sys
+          import time
+
+          for attempt in range(1, 16):
+              try:
+                  with socket.create_connection(("127.0.0.1", 5900), timeout=2):
+                      print("VNC server is listening on TCP port 5900.")
+                      sys.exit(0)
+              except OSError as error:
+                  print(f"Attempt {attempt}/15: VNC not ready: {error}")
+                  time.sleep(2)
+
+          print("::error::VNC did not start on TCP port 5900.")
+          sys.exit(1)
+          PY
 
           echo
-          echo "Checking VNC port..."
-          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || {
-            echo "::warning::Nothing appears to be listening on TCP port 5900."
-          }
+          echo "VNC-related processes:"
+          ps aux | grep -Ei "ARDAgent|screensharingd" | grep -v grep || true
 
-      - name: Open the Flutter project in Xcode
+          echo
+          echo "Port 5900 listener:"
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
+
+      - name: Prepare Flutter project
+        if: ${{ hashFiles('pubspec.yaml') != '' }}
         shell: bash
         run: |
+          if command -v flutter >/dev/null 2>&1; then
+            flutter --version
+            flutter pub get
+
+            if [[ -d ios ]]; then
+              cd ios
+              pod install || pod install --repo-update
+            fi
+          else
+            echo "Flutter is not currently installed; skipping Flutter preparation."
+          fi
+
+      - name: Open Xcode and Simulator
+        shell: bash
+        run: |
+          open -a Finder || true
+
           if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
+            echo "Opening Flutter Xcode workspace..."
             open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
           elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
+            echo "Opening Xcode project..."
             open -a Xcode "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
           else
+            echo "No iOS workspace found; opening Xcode."
             open -a Xcode || true
           fi
 
           open -a Simulator || true
+          sleep 5
 
       - name: Print VNC connection details
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not determine the Tailscale IP."
+            echo "::error::Could not determine the Tailscale IPv4 address."
+            tailscale status || true
             exit 1
           fi
 
           echo
-          echo "=============================================="
+          echo "================================================"
           echo " TEMPORARY MACOS VNC IS READY"
-          echo "=============================================="
-          echo "Address : $TS_IP:5900"
-          echo "Username: runner"
-          echo "Password: use your VNC_PASSWORD GitHub secret"
-          echo "Protocol: VNC"
-          echo "=============================================="
+          echo "================================================"
+          echo "Server   : $TS_IP:5900"
+          echo "Protocol : VNC"
+          echo "Username : leave blank"
+          echo "Password : value of GitHub secret VNC_PASSWORD"
+          echo "================================================"
+          echo
+          echo "Your Ubuntu machine must be connected to the"
+          echo "same Tailscale network."
 
           {
             echo "## Temporary macOS VNC"
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Address | \`$TS_IP:5900\` |"
-            echo "| Username | \`runner\` |"
-            echo "| Password | Value stored in \`VNC_PASSWORD\` |"
+            echo "| Server | \`$TS_IP:5900\` |"
             echo "| Protocol | VNC |"
-            echo
-            echo "The Ubuntu computer must be connected to the same Tailscale network."
+            echo "| Username | Leave blank |"
+            echo "| Password | Value stored in \`VNC_PASSWORD\` |"
+            echo "| Runner | \`macos-15\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the Mac running
+      - name: Keep macOS session running
         shell: bash
         run: |
-          echo "The temporary Mac will remain active until:"
-          echo "1. You cancel this workflow, or"
-          echo "2. The 180-minute timeout is reached."
-          echo
-          echo "Do not close this step while using VNC."
+          caffeinate -dimsu &
+          CAFFEINATE_PID=$!
+
+          cleanup() {
+            kill "$CAFFEINATE_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT INT TERM
+
+          echo "The temporary Mac is active."
+          echo "Cancel the workflow when finished."
 
           while true; do
-            echo "VNC session active: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "VNC active: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             sleep 300
           done
