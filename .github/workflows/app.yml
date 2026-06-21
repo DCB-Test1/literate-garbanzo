@@ -20,8 +20,8 @@ jobs:
       NOVNC_PORT: "6080"
 
       # Lower values reduce bandwidth and improve responsiveness.
-      NOVNC_QUALITY: "3"
-      NOVNC_COMPRESSION: "2"
+      NOVNC_QUALITY: "1"
+      NOVNC_COMPRESSION: "6"
 
       # The workflow tries these resolutions in order.
       TARGET_RESOLUTION: "1280x800"
