@@ -376,69 +376,144 @@ jobs:
           ls -lh "$RUNNER_TEMP/macos-desktop.png"
 
       - name: Install and patch noVNC
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          NOVNC_DIR="$RUNNER_TEMP/noVNC"
-
-          git clone \
-            --depth 1 \
-            --branch v1.7.0 \
-            https://github.com/novnc/noVNC.git \
-            "$NOVNC_DIR"
-
-          echo "Patching noVNC to prefer standard VNC password authentication..."
-
-          NOVNC_RFB="$NOVNC_DIR/core/rfb.js"
-
-          NOVNC_RFB="$NOVNC_RFB" python3 <<'PY'
-          import os
-          from pathlib import Path
-
-          path = Path(os.environ["NOVNC_RFB"])
-          source = path.read_text()
-
-          old = """        this._rfbAuthScheme = -1;
+    shell: bash
+    run: |
+      set -Eeuo pipefail
+  
+      NOVNC_DIR="$RUNNER_TEMP/noVNC"
+      NOVNC_REPOSITORY="https://github.com/novnc/noVNC.git"
+  
+      rm -rf "$NOVNC_DIR"
+      mkdir -p "$NOVNC_DIR"
+  
+      echo "Resolving the real noVNC v1.7.0 commit..."
+  
+      NOVNC_COMMIT="$(
+        git ls-remote "$NOVNC_REPOSITORY" \
+          'refs/tags/v1.7.0^{}' |
+        awk 'NR == 1 { print $1 }'
+      )"
+  
+      # Fallback in case Git returns no peeled annotated-tag reference.
+      if [[ -z "$NOVNC_COMMIT" ]]; then
+        NOVNC_COMMIT="$(
+          git ls-remote "$NOVNC_REPOSITORY" \
+            'refs/tags/v1.7.0' |
+          awk 'NR == 1 { print $1 }'
+        )"
+      fi
+  
+      if [[ -z "$NOVNC_COMMIT" ]]; then
+        echo "::error::Unable to resolve noVNC v1.7.0."
+        exit 1
+      fi
+  
+      echo "Resolved noVNC commit: $NOVNC_COMMIT"
+  
+      git -C "$NOVNC_DIR" init
+      git -C "$NOVNC_DIR" remote add origin "$NOVNC_REPOSITORY"
+      git -C "$NOVNC_DIR" fetch \
+        --depth=1 \
+        origin \
+        "$NOVNC_COMMIT"
+  
+      git -C "$NOVNC_DIR" checkout --detach FETCH_HEAD
+  
+      echo
+      echo "Installed noVNC commit:"
+      git -C "$NOVNC_DIR" log -1 --oneline
+  
+      NOVNC_RFB="$NOVNC_DIR/core/rfb.js"
+  
+      if [[ ! -f "$NOVNC_RFB" ]]; then
+        echo "::error::Missing noVNC file: $NOVNC_RFB"
+        exit 1
+      fi
+  
+      echo
+      echo "Patching noVNC to prefer standard VNC password authentication..."
+  
+      NOVNC_RFB="$NOVNC_RFB" python3 <<'PY'
+      import os
+      import re
+      import sys
+      from pathlib import Path
+  
+      path = Path(os.environ["NOVNC_RFB"])
+      source = path.read_text(encoding="utf-8")
+  
+      # Patch only the main RFB security-type selection block.
+      # Do not patch the separate VeNCrypt subtype-selection block.
+      pattern = re.compile(
+          r"""
+          this\._rfbAuthScheme\s*=\s*-1;\s*
+          for\s*\(\s*let\s+type\s+of\s+types\s*\)\s*\{\s*
+              if\s*\(\s*this\._isSupportedSecurityType\(type\)\s*\)\s*\{\s*
+                  this\._rfbAuthScheme\s*=\s*type;\s*
+                  break;\s*
+              \}\s*
+          \}
+          """,
+          re.VERBOSE,
+      )
+  
+      replacement = """this._rfbAuthScheme = -1;
+  
+              // Apple normally advertises ARD authentication before
+              // standard password-only VNC authentication. Prefer type 2.
+              if (types.includes(securityTypeVNCAuth)) {
+                  this._rfbAuthScheme = securityTypeVNCAuth;
+              } else {
                   for (let type of types) {
                       if (this._isSupportedSecurityType(type)) {
                           this._rfbAuthScheme = type;
                           break;
                       }
                   }
-          """
+              }"""
+  
+      patched, replacement_count = pattern.subn(
+          replacement,
+          source,
+          count=1,
+      )
+  
+      if replacement_count != 1:
+          print(
+              "::error::Unable to uniquely locate noVNC's main "
+              "security-selection block."
+          )
+  
+          marker = "Server security types"
+          position = source.find(marker)
+  
+          if position >= 0:
+              start = max(0, position - 500)
+              end = min(len(source), position + 1500)
+  
+              print("Relevant noVNC source:")
+              print(source[start:end])
+  
+          sys.exit(1)
+  
+      path.write_text(patched, encoding="utf-8")
+  
+      print("noVNC authentication patch applied successfully.")
+      PY
+  
+      echo
+      echo "=== Confirming patch ==="
+  
+      grep -n -A12 -B4 \
+        "Apple normally advertises ARD" \
+        "$NOVNC_RFB"
+  
+      echo
+      echo "=== JavaScript syntax check ==="
+  
+      node --check "$NOVNC_RFB"
 
-          new = """        this._rfbAuthScheme = -1;
-
-                  // Apple normally advertises ARD authentication first.
-                  // Prefer classic password-only VNC when it is available.
-                  if (types.includes(securityTypeVNCAuth)) {
-                      this._rfbAuthScheme = securityTypeVNCAuth;
-                  } else {
-                      for (let type of types) {
-                          if (this._isSupportedSecurityType(type)) {
-                              this._rfbAuthScheme = type;
-                              break;
-                          }
-                      }
-                  }
-          """
-
-          if old not in source:
-              raise SystemExit(
-                  "::error::Unable to locate noVNC security-selection code."
-              )
-
-          path.write_text(source.replace(old, new, 1))
-
-          print("noVNC authentication preference patched successfully.")
-          PY
-
-          grep -n \
-            "Prefer classic password-only VNC" \
-            "$NOVNC_RFB"
-
-          echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
+    echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
 
       - name: Start noVNC
         shell: bash
