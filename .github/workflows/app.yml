@@ -1,4 +1,4 @@
-name: Temporary macOS VNC via ngrok
+name: CF App Debug
 
 on:
   workflow_dispatch:
@@ -7,28 +7,23 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporary-macos-vnc-ngrok
+  group: cloudflare-debug
   cancel-in-progress: true
 
 jobs:
-  macos-vnc:
+  macos-desktop:
     runs-on: macos-14
     timeout-minutes: 180
 
     env:
       VNC_PORT: "5900"
+      NOVNC_PORT: "6080"
 
     steps:
-      # -----------------------------------------------------------
-      # CHECKOUT
-      # -----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------
-      # RUNNER DETAILS
-      # -----------------------------------------------------------
-      - name: Show macOS environment
+      - name: Show macOS information
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -45,7 +40,7 @@ jobs:
           csrutil status || true
 
           echo
-          echo "=== Current user ==="
+          echo "=== User ==="
           whoami
           id
 
@@ -62,19 +57,10 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
-          echo
-          echo "=== Xcode applications ==="
-          find /Applications \
-            -maxdepth 1 \
-            -type d \
-            -name 'Xcode*.app' \
-            -print \
-            | sort
-
       # -----------------------------------------------------------
-      # ENABLE VNC + TCC PERMISSIONS
+      # ENABLE MACOS VNC AND SCREEN CAPTURE
       # -----------------------------------------------------------
-      - name: Configure macOS Screen Sharing and VNC
+      - name: Enable macOS Screen Sharing
         shell: bash
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -95,29 +81,27 @@ jobs:
           password = os.environ.get("VNC_PASSWORD", "")
 
           try:
-              raw = password.encode("ascii")
+              encoded = password.encode("ascii")
           except UnicodeEncodeError:
               print("::error::VNC_PASSWORD must contain ASCII characters only.")
               sys.exit(1)
 
-          if len(raw) != 8:
+          if len(encoded) != 8:
               print(
                   "::error::VNC_PASSWORD must be exactly 8 ASCII characters. "
-                  f"Received {len(raw)} bytes."
+                  f"Received {len(encoded)} bytes."
               )
               sys.exit(1)
 
-          print("VNC password validation passed.")
+          print("VNC password is valid.")
           PY
-
-          sudo -n true
 
           TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
           KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
           SCREENSHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
 
           if [[ ! -f "$TCC_DB" ]]; then
-            echo "::error::TCC database not found: $TCC_DB"
+            echo "::error::TCC database was not found."
             exit 1
           fi
 
@@ -126,9 +110,9 @@ jobs:
             exit 1
           fi
 
-          echo
-          echo "=== Testing system TCC database ==="
+          sudo -n true
 
+          echo "Testing system TCC database..."
           sudo sqlite3 "$TCC_DB" "
             BEGIN IMMEDIATE;
 
@@ -139,11 +123,7 @@ jobs:
             ROLLBACK;
           "
 
-          echo "System TCC database is writable."
-
-          echo
-          echo "=== Loading Screen Sharing service ==="
-
+          echo "Loading Screen Sharing service..."
           sudo launchctl enable system/com.apple.screensharing || true
 
           sudo launchctl bootstrap \
@@ -153,8 +133,7 @@ jobs:
 
           EPOCH="$(date +%s)"
 
-          echo
-          echo "=== Granting Screen Sharing TCC permissions ==="
+          echo "Granting screen capture and remote-input permissions..."
 
           sudo sqlite3 "$TCC_DB" <<SQL
           BEGIN IMMEDIATE;
@@ -218,7 +197,7 @@ jobs:
           SQL
 
           echo
-          echo "=== Installed TCC entries ==="
+          echo "=== TCC permissions ==="
 
           sudo sqlite3 \
             -header \
@@ -227,7 +206,6 @@ jobs:
               SELECT
                 service,
                 client,
-                client_type,
                 auth_value,
                 auth_reason,
                 last_modified
@@ -236,23 +214,22 @@ jobs:
             "
 
           echo
-          echo "=== Restarting TCC daemons ==="
+          echo "Restarting TCC..."
 
           sudo killall tccd 2>/dev/null || true
           killall tccd 2>/dev/null || true
           sleep 4
 
-          echo
-          echo "=== Stopping existing Remote Management processes ==="
+          echo "Stopping old Screen Sharing processes..."
 
           sudo "$KICKSTART" -deactivate || true
           sudo killall ARDAgent 2>/dev/null || true
           sudo killall ScreensharingAgent 2>/dev/null || true
           sudo killall screensharingd 2>/dev/null || true
+
           sleep 3
 
-          echo
-          echo "=== Activating Remote Management ==="
+          echo "Activating Remote Management..."
 
           sudo "$KICKSTART" \
             -activate \
@@ -261,8 +238,7 @@ jobs:
             -allowAccessFor -allUsers \
             -privs -all
 
-          echo
-          echo "=== Enabling legacy VNC authentication ==="
+          echo "Enabling legacy VNC authentication..."
 
           sudo "$KICKSTART" \
             -configure \
@@ -270,8 +246,7 @@ jobs:
             -setvnclegacy \
             -vnclegacy yes
 
-          echo
-          echo "=== Setting VNC password ==="
+          echo "Setting VNC password..."
 
           sudo "$KICKSTART" \
             -configure \
@@ -279,8 +254,7 @@ jobs:
             -setvncpw \
             -vncpw "$VNC_PASSWORD"
 
-          echo
-          echo "=== Starting Screen Sharing ==="
+          echo "Starting Screen Sharing..."
 
           sudo launchctl enable system/com.apple.screensharing || true
           sudo launchctl kickstart -k system/com.apple.screensharing || true
@@ -289,7 +263,7 @@ jobs:
           sleep 10
 
           echo
-          echo "=== Waiting for VNC port ${VNC_PORT} ==="
+          echo "Waiting for VNC port ${VNC_PORT}..."
 
           READY=0
 
@@ -300,35 +274,23 @@ jobs:
               break
             fi
 
-            echo "Attempt ${attempt}/30: VNC not ready."
+            echo "Attempt ${attempt}/30: waiting for VNC..."
             sleep 2
           done
 
           if [[ "$READY" -ne 1 ]]; then
             echo "::error::VNC did not start."
 
-            echo
-            echo "=== Processes ==="
             ps aux |
               grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
               grep -v grep || true
 
-            echo
-            echo "=== Ports ==="
             sudo lsof -nP -iTCP -sTCP:LISTEN || true
-
             exit 1
           fi
 
           echo
-          echo "=== VNC processes ==="
-
-          ps aux |
-            grep -Ei "ARDAgent|Screen.?sharing|AppleVNC" |
-            grep -v grep || true
-
-          echo
-          echo "=== Port 5900 listener ==="
+          echo "=== VNC listener ==="
 
           sudo lsof \
             -nP \
@@ -336,18 +298,14 @@ jobs:
             -sTCP:LISTEN || true
 
       # -----------------------------------------------------------
-      # VERIFY LOCAL VNC HANDSHAKE
+      # VERIFY RAW LOCAL VNC
       # -----------------------------------------------------------
       - name: Verify local VNC protocol
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "=== Port test ==="
           nc -vz 127.0.0.1 "$VNC_PORT"
-
-          echo
-          echo "=== VNC protocol banner ==="
 
           BANNER="$(
             python3 - <<'PY'
@@ -358,214 +316,197 @@ jobs:
           PY
           )"
 
-          echo "$BANNER"
+          echo "VNC protocol response: $BANNER"
 
           if [[ "$BANNER" != RFB* ]]; then
-            echo "::error::Port 5900 did not return an RFB/VNC protocol banner."
+            echo "::error::Port 5900 did not return an RFB/VNC response."
             exit 1
           fi
 
-          echo "Local VNC protocol is responding."
-
       # -----------------------------------------------------------
-      # INSTALL NGROK
+      # INSTALL AND START NOVNC
       # -----------------------------------------------------------
-      - name: Install ngrok
+      - name: Install noVNC
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          if command -v ngrok >/dev/null 2>&1; then
-            echo "ngrok is already installed."
-          else
-            brew install ngrok/ngrok/ngrok
-          fi
+          NOVNC_DIR="$RUNNER_TEMP/noVNC"
 
-          echo
-          echo "=== ngrok version ==="
-          ngrok version
+          git clone \
+            --depth 1 \
+            https://github.com/novnc/noVNC.git \
+            "$NOVNC_DIR"
 
-      # -----------------------------------------------------------
-      # START PUBLIC NGROK TCP TUNNEL
-      # -----------------------------------------------------------
-      - name: Start ngrok TCP tunnel
+          echo "NOVNC_DIR=$NOVNC_DIR" >> "$GITHUB_ENV"
+
+      - name: Start noVNC web server
         shell: bash
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "${NGROK_AUTHTOKEN:-}" ]]; then
-            echo "::error::NGROK_AUTHTOKEN GitHub secret is missing."
-            exit 1
-          fi
-
-          echo "::add-mask::$NGROK_AUTHTOKEN"
-
-          echo "Adding ngrok authtoken..."
-          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-
-          echo
-          echo "Starting ngrok TCP tunnel:"
-          echo "public TCP endpoint -> 127.0.0.1:${VNC_PORT}"
-
-          nohup ngrok tcp "127.0.0.1:${VNC_PORT}" \
-            --log=stdout \
-            --log-format=json \
-            > "$RUNNER_TEMP/ngrok.log" \
+          nohup "$NOVNC_DIR/utils/novnc_proxy" \
+            --listen "$NOVNC_PORT" \
+            --vnc "127.0.0.1:${VNC_PORT}" \
+            > "$RUNNER_TEMP/novnc.log" \
             2>&1 &
 
-          NGROK_PID=$!
+          NOVNC_PID=$!
 
-          echo "NGROK_PID=$NGROK_PID" >> "$GITHUB_ENV"
-          echo "$NGROK_PID" > "$RUNNER_TEMP/ngrok.pid"
+          echo "NOVNC_PID=$NOVNC_PID" >> "$GITHUB_ENV"
+          echo "$NOVNC_PID" > "$RUNNER_TEMP/novnc.pid"
 
-          echo
-          echo "Waiting for the ngrok local API..."
+          echo "Waiting for noVNC..."
 
-          API_READY=0
+          READY=0
 
           for attempt in {1..30}; do
             if curl \
               --silent \
               --fail \
-              http://127.0.0.1:4040/api/tunnels \
+              "http://127.0.0.1:${NOVNC_PORT}/vnc.html" \
               >/dev/null; then
-              API_READY=1
+              READY=1
               break
             fi
 
-            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
-              echo "::error::ngrok stopped before creating the tunnel."
-              cat "$RUNNER_TEMP/ngrok.log" || true
+            if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
+              echo "::error::noVNC stopped unexpectedly."
+              cat "$RUNNER_TEMP/novnc.log" || true
               exit 1
             fi
 
-            echo "Attempt ${attempt}/30: waiting for ngrok..."
+            echo "Attempt ${attempt}/30: waiting for noVNC..."
             sleep 2
           done
 
-          if [[ "$API_READY" -ne 1 ]]; then
-            echo "::error::ngrok API did not become ready."
-            cat "$RUNNER_TEMP/ngrok.log" || true
+          if [[ "$READY" -ne 1 ]]; then
+            echo "::error::noVNC did not start."
+            cat "$RUNNER_TEMP/novnc.log" || true
             exit 1
           fi
-
-          NGROK_URL="$(
-            curl \
-              --silent \
-              http://127.0.0.1:4040/api/tunnels |
-            python3 -c '
-          import json
-          import sys
-
-          payload = json.load(sys.stdin)
-
-          for tunnel in payload.get("tunnels", []):
-              url = tunnel.get("public_url", "")
-              if url.startswith("tcp://"):
-                  print(url)
-                  break
-          '
-          )"
-
-          if [[ -z "$NGROK_URL" ]]; then
-            echo "::error::ngrok did not return a TCP public URL."
-
-            echo
-            echo "=== ngrok API response ==="
-            curl \
-              --silent \
-              http://127.0.0.1:4040/api/tunnels || true
-
-            echo
-            echo "=== ngrok log ==="
-            cat "$RUNNER_TEMP/ngrok.log" || true
-
-            exit 1
-          fi
-
-          NGROK_ADDRESS="${NGROK_URL#tcp://}"
-          NGROK_HOST="${NGROK_ADDRESS%:*}"
-          NGROK_PORT="${NGROK_ADDRESS##*:}"
-
-          echo "NGROK_URL=$NGROK_URL" >> "$GITHUB_ENV"
-          echo "NGROK_ADDRESS=$NGROK_ADDRESS" >> "$GITHUB_ENV"
-          echo "NGROK_HOST=$NGROK_HOST" >> "$GITHUB_ENV"
-          echo "NGROK_PORT=$NGROK_PORT" >> "$GITHUB_ENV"
 
           echo
-          echo "ngrok tunnel created successfully."
-          echo "Public endpoint: $NGROK_ADDRESS"
+          echo "noVNC is available locally:"
+          echo "http://127.0.0.1:${NOVNC_PORT}/vnc.html"
+
+          echo
+          echo "=== noVNC log ==="
+          cat "$RUNNER_TEMP/novnc.log" || true
 
       # -----------------------------------------------------------
-      # OPTIONAL FLUTTER PREPARATION
+      # INSTALL CLOUDFLARED
       # -----------------------------------------------------------
-      - name: Install Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Prepare Flutter project
-        if: ${{ hashFiles('pubspec.yaml') != '' }}
+      - name: Install Cloudflare Tunnel
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          flutter --version
-          flutter pub get
-
-          if [[ -f "$GITHUB_WORKSPACE/ios/Podfile" ]]; then
-            cd "$GITHUB_WORKSPACE/ios"
-            pod install --repo-update
+          if command -v cloudflared >/dev/null 2>&1; then
+            echo "cloudflared is already installed."
+          else
+            brew install cloudflared
           fi
 
+          cloudflared --version
+
       # -----------------------------------------------------------
-      # OPEN XCODE + SIMULATOR
+      # START FREE CLOUDFLARE QUICK TUNNEL
       # -----------------------------------------------------------
-      - name: Open Xcode and Simulator
+      - name: Start Cloudflare Quick Tunnel
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          DEVELOPER_DIR_PATH="$(xcode-select -p)"
-          XCODE_APP="$(dirname "$(dirname "$DEVELOPER_DIR_PATH")")"
-          SIMULATOR_APP="${DEVELOPER_DIR_PATH}/Applications/Simulator.app"
+          nohup cloudflared tunnel \
+            --url "http://127.0.0.1:${NOVNC_PORT}" \
+            --no-autoupdate \
+            > "$RUNNER_TEMP/cloudflared.log" \
+            2>&1 &
 
-          echo "Xcode application: $XCODE_APP"
-          echo "Simulator application: $SIMULATOR_APP"
+          CLOUDFLARED_PID=$!
 
-          open -a Finder "$GITHUB_WORKSPACE" || true
+          echo "CLOUDFLARED_PID=$CLOUDFLARED_PID" >> "$GITHUB_ENV"
+          echo "$CLOUDFLARED_PID" > "$RUNNER_TEMP/cloudflared.pid"
 
-          if [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" ]]; then
-            echo "Opening Runner.xcworkspace..."
-            open "$GITHUB_WORKSPACE/ios/Runner.xcworkspace" || true
+          echo "Waiting for Cloudflare Quick Tunnel URL..."
 
-          elif [[ -d "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" ]]; then
-            echo "Opening Runner.xcodeproj..."
-            open "$GITHUB_WORKSPACE/ios/Runner.xcodeproj" || true
+          CF_URL=""
 
-          elif [[ -d "$XCODE_APP" ]]; then
-            echo "Opening Xcode application..."
-            open "$XCODE_APP" || true
+          for attempt in {1..60}; do
+            CF_URL="$(
+              grep -Eo \
+                'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+                "$RUNNER_TEMP/cloudflared.log" |
+              head -n 1 || true
+            )"
+
+            if [[ -n "$CF_URL" ]]; then
+              break
+            fi
+
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "::error::cloudflared stopped unexpectedly."
+              cat "$RUNNER_TEMP/cloudflared.log" || true
+              exit 1
+            fi
+
+            echo "Attempt ${attempt}/60: waiting for URL..."
+            sleep 2
+          done
+
+          if [[ -z "$CF_URL" ]]; then
+            echo "::error::Cloudflare did not provide a Quick Tunnel URL."
+
+            echo
+            echo "=== cloudflared log ==="
+            cat "$RUNNER_TEMP/cloudflared.log" || true
+
+            exit 1
           fi
 
-          if [[ -d "$SIMULATOR_APP" ]]; then
-            open "$SIMULATOR_APP" || true
+          echo "CF_URL=$CF_URL" >> "$GITHUB_ENV"
+
+          NOVNC_URL="${CF_URL}/vnc.html?autoconnect=true&resize=scale&path=websockify"
+
+          echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
+
+          echo
+          echo "Cloudflare URL created: $CF_URL"
+
+          echo
+          echo "Waiting for public noVNC page..."
+
+          PUBLIC_READY=0
+
+          for attempt in {1..30}; do
+            if curl \
+              --silent \
+              --fail \
+              "${CF_URL}/vnc.html" \
+              >/dev/null; then
+              PUBLIC_READY=1
+              break
+            fi
+
+            echo "Attempt ${attempt}/30: waiting for public URL..."
+            sleep 3
+          done
+
+          if [[ "$PUBLIC_READY" -ne 1 ]]; then
+            echo "::warning::The tunnel URL exists but the public page was not ready yet."
+            echo "::warning::Open the URL manually after a few seconds."
           fi
 
-          sleep 15
-
       # -----------------------------------------------------------
-      # VERIFY DESKTOP CAPTURE
+      # VERIFY MACOS DESKTOP CAPTURE
       # -----------------------------------------------------------
-      - name: Capture desktop verification screenshot
+      - name: Capture desktop screenshot
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          SCREENSHOT="$RUNNER_TEMP/macos-vnc-desktop.png"
+          SCREENSHOT="$RUNNER_TEMP/macos-desktop.png"
 
           screencapture -x "$SCREENSHOT"
 
@@ -577,66 +518,58 @@ jobs:
           ls -lh "$SCREENSHOT"
           file "$SCREENSHOT"
 
-      - name: Upload desktop verification screenshot
+      - name: Upload desktop screenshot
         uses: actions/upload-artifact@v4
         with:
-          name: macos-vnc-desktop
-          path: ${{ runner.temp }}/macos-vnc-desktop.png
+          name: macos-desktop
+          path: ${{ runner.temp }}/macos-desktop.png
           if-no-files-found: error
           retention-days: 1
 
       # -----------------------------------------------------------
-      # PRINT NGROK/VNC DETAILS
+      # PRINT BROWSER CONNECTION DETAILS
       # -----------------------------------------------------------
-      - name: Print VNC connection details
+      - name: Print browser connection details
         shell: bash
         run: |
           set -Eeuo pipefail
 
           echo
-          echo "=================================================="
-          echo " TEMPORARY MACOS VNC VIA NGROK IS READY"
-          echo "=================================================="
-          echo "Server       : ${NGROK_ADDRESS}"
-          echo "Host         : ${NGROK_HOST}"
-          echo "Port         : ${NGROK_PORT}"
-          echo "Protocol     : VNC"
-          echo "Username     : leave blank"
-          echo "Password     : value of VNC_PASSWORD secret"
-          echo "=================================================="
+          echo "======================================================"
+          echo " MACOS BROWSER DESKTOP IS READY"
+          echo "======================================================"
           echo
-          echo "TigerVNC command:"
+          echo "Open this URL:"
           echo
-          echo "vncviewer -SecurityTypes=VncAuth ${NGROK_HOST}::${NGROK_PORT}"
+          echo "$NOVNC_URL"
           echo
-          echo "Remmina server:"
+          echo "Password: value stored in VNC_PASSWORD"
+          echo "Username: none"
           echo
-          echo "${NGROK_HOST}:${NGROK_PORT}"
+          echo "No VNC client, Tailscale or ngrok is required."
           echo
+          echo "======================================================"
 
           {
-            echo "## Temporary macOS VNC via ngrok"
+            echo "## macOS browser desktop"
+            echo
+            echo "Open the following address:"
+            echo
+            echo "**[$NOVNC_URL]($NOVNC_URL)**"
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
-            echo "| Server | \`${NGROK_ADDRESS}\` |"
-            echo "| Host | \`${NGROK_HOST}\` |"
-            echo "| Port | \`${NGROK_PORT}\` |"
-            echo "| Protocol | VNC |"
-            echo "| Username | Leave blank |"
+            echo "| Username | None |"
             echo "| Password | Value stored in \`VNC_PASSWORD\` |"
+            echo "| Transport | Cloudflare HTTPS + noVNC |"
             echo
-            echo "### TigerVNC"
-            echo
-            echo "\`\`\`bash"
-            echo "vncviewer -SecurityTypes=VncAuth ${NGROK_HOST}::${NGROK_PORT}"
-            echo "\`\`\`"
+            echo "Cancel the workflow when finished."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # -----------------------------------------------------------
-      # KEEP SESSION RUNNING
+      # KEEP SESSION ACTIVE
       # -----------------------------------------------------------
-      - name: Keep macOS VNC session running
+      - name: Keep macOS desktop running
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -645,30 +578,48 @@ jobs:
           CAFFEINATE_PID=$!
 
           cleanup() {
-            echo "Stopping keep-alive processes..."
+            echo "Stopping services..."
 
             kill "$CAFFEINATE_PID" 2>/dev/null || true
 
-            if [[ -f "$RUNNER_TEMP/ngrok.pid" ]]; then
-              kill "$(cat "$RUNNER_TEMP/ngrok.pid")" 2>/dev/null || true
+            if [[ -f "$RUNNER_TEMP/cloudflared.pid" ]]; then
+              kill "$(cat "$RUNNER_TEMP/cloudflared.pid")" 2>/dev/null || true
+            fi
+
+            if [[ -f "$RUNNER_TEMP/novnc.pid" ]]; then
+              kill "$(cat "$RUNNER_TEMP/novnc.pid")" 2>/dev/null || true
             fi
           }
 
           trap cleanup EXIT INT TERM
 
-          echo "Temporary macOS VNC session is active."
-          echo "Cancel the GitHub workflow when finished."
-          echo
+          echo "macOS browser desktop is running."
+          echo "URL: $NOVNC_URL"
+          echo "Cancel the workflow when finished."
 
           while true; do
-            echo "VNC alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "ngrok endpoint: ${NGROK_ADDRESS}"
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "::error::Cloudflare Tunnel stopped."
 
-            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
-              echo "::error::ngrok process stopped unexpectedly."
-              cat "$RUNNER_TEMP/ngrok.log" || true
+              echo
+              echo "=== cloudflared log ==="
+              cat "$RUNNER_TEMP/cloudflared.log" || true
+
               exit 1
             fi
+
+            if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
+              echo "::error::noVNC stopped."
+
+              echo
+              echo "=== noVNC log ==="
+              cat "$RUNNER_TEMP/novnc.log" || true
+
+              exit 1
+            fi
+
+            echo "Desktop alive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "URL: $NOVNC_URL"
 
             sleep 300
           done
