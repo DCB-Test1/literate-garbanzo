@@ -1,4 +1,4 @@
-name: Temporary macOS VNC
+name: APP DEBUG
 
 on:
   workflow_dispatch:
